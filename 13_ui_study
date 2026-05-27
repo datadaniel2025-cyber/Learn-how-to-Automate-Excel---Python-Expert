@@ -1,26 +1,26 @@
 def launch_ui() -> tuple:
     root = tk.Tk()
-    root.title("Comparison Report — Setup")
+    root.title("REFFF")
     root.resizable(False, False)
-    root.geometry("500x210")
+    root.geometry("500x250")
 
     # ── centre on screen ──────────────────────────────────────────────────────
     root.update_idletasks()
     x = (root.winfo_screenwidth()  - 500) // 2
-    y = (root.winfo_screenheight() - 210) // 2
-    root.geometry(f"500x210+{x}+{y}")
+    y = (root.winfo_screenheight() - 250) // 2
+    root.geometry(f"500x250+{x}+{y}")
 
-    selected_pfx  = tk.StringVar(value="REFFFF")
+    selected_pfx  = tk.StringVar(value="REFFF")
     selected_file = tk.StringVar(value="")
 
     pad = {"padx": 15, "pady": 6}
 
     # ── Row 0: PFX dropdown ───────────────────────────────────────────────────
-    tk.Label(root, text="REFFFFFF", font=("Arial", 10, "bold")).grid(
+    tk.Label(root, text="REFFF", font=("Arial", 10, "bold")).grid(
         row=0, column=0, sticky="w", **pad)
     pfx_combo = ttk.Combobox(
         root, textvariable=selected_pfx,
-        values=[REFFFFF],          # ← add more options here if needed
+        values=[REFFF],          # ← add more options here if needed
         state="readonly", width=12,
     )
     pfx_combo.grid(row=0, column=1, sticky="w", **pad)
@@ -42,8 +42,15 @@ def launch_ui() -> tuple:
     tk.Button(root, text="Browse…", command=browse, width=9).grid(
         row=2, column=1, padx=10, pady=2)
 
-    # ── Row 3: Run / Cancel buttons ───────────────────────────────────────────
+    # ── Row 3: status label (shows Processing… then Done) ────────────────────
+    status_lbl = tk.Label(root, text="", font=("Arial", 10, "italic"), fg="#555555")
+    status_lbl.grid(row=3, column=0, columnspan=2, pady=(10, 0))
+
+    # ── Row 4: Run / Cancel buttons ───────────────────────────────────────────
     confirmed = [False]
+
+    btn_frame = tk.Frame(root)
+    btn_frame.grid(row=4, column=0, columnspan=2, pady=12)
 
     def on_run():
         if not selected_file.get():
@@ -51,22 +58,44 @@ def launch_ui() -> tuple:
                 "Please select a comparison file (.xlsm or .xlsx) before continuing.")
             return
         confirmed[0] = True
-        root.destroy()
+        # Switch UI to "processing" state — disable controls so user can't click again
+        run_btn.config(text="⏳  Processing…", state="disabled", bg="#888888")
+        cancel_btn.config(state="disabled")
+        pfx_combo.config(state="disabled")
+        status_lbl.config(text="Running… this may take a few minutes. Please wait.", fg="#B8860B")
+        root.update()   # force the window to repaint before script blocks the thread
+        root.quit()     # exit mainloop — window stays open, script continues
 
     def on_cancel():
         root.destroy()
 
-    btn_frame = tk.Frame(root)
-    btn_frame.grid(row=3, column=0, columnspan=2, pady=15)
-    tk.Button(btn_frame, text="▶  Run", width=12, command=on_run,
-              bg="#2E75B6", fg="white", font=("Arial", 10, "bold")).pack(side="left", padx=10)
-    tk.Button(btn_frame, text="Cancel",  width=10, command=on_cancel).pack(side="left", padx=10)
+    run_btn    = tk.Button(btn_frame, text="▶  Run", width=12, command=on_run,
+                           bg="#2E75B6", fg="white", font=("Arial", 10, "bold"))
+    cancel_btn = tk.Button(btn_frame, text="Cancel", width=10, command=on_cancel)
+    run_btn.pack(side="left", padx=10)
+    cancel_btn.pack(side="left", padx=10)
 
-    root.mainloop()
+    root.mainloop()   # ← first mainloop: waits for Run or Cancel
 
     if not confirmed[0]:
+        root.destroy()
         print("Cancelled by user — exiting.")
         exit()
 
-    return selected_pfx.get(), selected_file.get()
+    return selected_pfx.get(), selected_file.get(), root, status_lbl, run_btn
+
+
+def ui_finish(root, status_lbl, run_btn) -> None:
+    """
+    Call this at the very end of the script (after export_to_excel).
+    Updates the window to show Export Complete and keeps it open
+    until the user closes it manually.
+    """
+    status_lbl.config(
+        text="✅  Export complete!  You can now close this window.",
+        fg="#375623",
+        font=("Arial", 11, "bold"),
+    )
+    run_btn.config(text="✅  Done", bg="#375623", fg="white")
+    root.mainloop()   # ← second mainloop: keeps window open until user closes
 # ══════════════════════════════════════════════════════════════════════════════
