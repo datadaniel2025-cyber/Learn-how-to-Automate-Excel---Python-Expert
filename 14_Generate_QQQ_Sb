@@ -1,1 +1,161 @@
 
+import json
+import re
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from datetime import date, timedelta
+from pathlib import Path
+
+import openpyxl
+import pandas as pd
+
+
+# =============================================================================
+# CONSTANTS — Required columns per sheet
+# =============================================================================
+
+PRAC_REQUIRED_COLUMNS: list[str] = [
+   #REFFF
+]
+
+FAC_REQUIRED_COLUMNS: list[str] = [
+   #REFFF
+]
+
+_SHEET_COLUMNS: dict[str, list[str]] = {
+    "PRAC": PRAC_REQUIRED_COLUMNS,
+    "FAC":  FAC_REQUIRED_COLUMNS,
+}
+
+
+# =============================================================================
+# SETTINGS MANAGER
+# =============================================================================
+
+_CONFIG_DIR = Path(__file__).parent / "config"
+
+# -----------------------------------------------------------------------------
+# DDDD — config paths, slugs, and per-option defaults
+# To add a new DSNP market: add to dsnp_settings.json "options" list and
+# (optionally) add a slug here if the name has unusual spacing.
+# The fallback slug is: option.lower().replace(" ", "_")
+# -----------------------------------------------------------------------------
+_DSNP_CONFIG_PATH = _CONFIG_DIR / "dsnp_settings.json"   # global options list
+
+_DSNP_OPTION_SLUGS: dict[str, str] = {
+   #REFFF
+}
+
+_DSNP_GLOBAL_DEFAULTS: dict = {"options": [#REFFF]}
+
+_DSNP_OPTION_DEFAULTS: dict = {
+    "output_dir": "output/",
+    "pcp_specialty_code": [],
+    "pediatric_keywords": [],
+    "primary_care_keywords": [],
+    "urgent_care_keywords": [],
+    "inpatient_hospitalist_keywords": [],
+    "specialty_keywords": [],
+    "outpatient_taxonomy_override": [],
+    "pcp_exclusion_list": [],
+    "exclusion_tin": [],
+    "pcp_exclusion_group_name_list": [],
+    "deactivated_npi": [],
+    "pcp_custom_exclusion": [],
+}
+
+# -----------------------------------------------------------------------------
+# QQQQ — config paths, slugs, and per-option defaults
+# Same pattern as DSNP.  Add new QHP markets the same way.
+# -----------------------------------------------------------------------------
+_QHP_CONFIG_PATH = _CONFIG_DIR / "qhp_settings.json"     # global options list
+
+_QHP_OPTION_SLUGS: dict[str, str] = {
+    "#REFFF
+}
+
+_QHP_GLOBAL_DEFAULTS: dict = {"options": [#REFFF]}
+
+_QHP_OPTION_DEFAULTS: dict = {
+    "output_dir": "output/",
+    "pcp_specialty_code": [],
+    "primary_care_keywords": [],
+    "urgent_care_keywords": [],
+    "inpatient_hospitalist_keywords": [],
+    "specialty_keywords": [],
+    "pcp_exclusion_list": [],
+    "exclusion_tin": [],
+    "pcp_exclusion_group_name_list": [],
+    "deactivated_npi": [],
+    "pcp_custom_exclusion": [],
+}
+
+
+class SettingsManager:
+    def __init__(self):
+        self._dsnp_global = self._load(_DSNP_CONFIG_PATH, _DSNP_GLOBAL_DEFAULTS)
+        # Load one dict per DDDD option from its own JSON file
+        self._dsnp_opts: dict[str, dict] = {}
+        for option in self._dsnp_global.get("options", list(_DSNP_OPTION_SLUGS)):
+            slug = _DSNP_OPTION_SLUGS.get(option, option.lower().replace(" ", "_"))
+            path = _CONFIG_DIR / f"{slug}_settings.json"
+            self._dsnp_opts[option] = self._load(path, dict(_DSNP_OPTION_DEFAULTS))
+        self._qhp_global = self._load(_QHP_CONFIG_PATH, _QHP_GLOBAL_DEFAULTS)
+        self._qhp_opts: dict[str, dict] = {}
+        for option in self._qhp_global.get("options", list(_QHP_OPTION_SLUGS)):
+            slug = _QHP_OPTION_SLUGS.get(option, option.lower().replace(" ", "_"))
+            path = _CONFIG_DIR / f"{slug}_settings.json"
+            self._qhp_opts[option] = self._load(path, dict(_QHP_OPTION_DEFAULTS))
+
+    @staticmethod
+    def _load(path: Path, defaults: dict) -> dict:
+        if path.exists():
+            with path.open("r") as f:
+                return json.load(f)
+        return dict(defaults)
+
+    def get(self, section: str, key: str = None):
+        """Global (options-list only) settings for DSNP or QHP."""
+        data = self._dsnp_global if section == "dsnp" else self._qhp_global
+        return data.get(key) if key else data
+
+    def get_dsnp(self, option: str, key: str = None):
+        """Per-option DSNP settings (keywords, exclusions, etc.)."""
+        data = self._dsnp_opts.get(option, {})
+        return data.get(key) if key else data
+
+    def get_qhp(self, option: str, key: str = None):
+        """Per-option QHP settings."""
+        data = self._qhp_opts.get(option, {})
+        return data.get(key) if key else data
+
+    def set(self, section: str, key: str, value):
+        """Save global settings."""
+        if section == "dsnp":
+            self._dsnp_global[key] = value
+            self._save(_DSNP_CONFIG_PATH, self._dsnp_global)
+        else:
+            self._qhp_global[key] = value
+            self._save(_QHP_CONFIG_PATH, self._qhp_global)
+
+    def set_dsnp(self, option: str, key: str, value):
+        """Save per-option DSNP settings to the option's own JSON file."""
+        if option not in self._dsnp_opts:
+            self._dsnp_opts[option] = dict(_DSNP_OPTION_DEFAULTS)
+        self._dsnp_opts[option][key] = value
+        slug = _DSNP_OPTION_SLUGS.get(option, option.lower().replace(" ", "_"))
+        self._save(_CONFIG_DIR / f"{slug}_settings.json", self._dsnp_opts[option])
+
+    def set_qhp(self, option: str, key: str, value):
+        """Save per-option QHP settings to the option's own JSON file."""
+        if option not in self._qhp_opts:
+            self._qhp_opts[option] = dict(_QHP_OPTION_DEFAULTS)
+        self._qhp_opts[option][key] = value
+        slug = _QHP_OPTION_SLUGS.get(option, option.lower().replace(" ", "_"))
+        self._save(_CONFIG_DIR / f"{slug}_settings.json", self._qhp_opts[option])
+
+    @staticmethod
+    def _save(path: Path, data: dict):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w") as f:
+            json.dump(data, f, indent=2)
