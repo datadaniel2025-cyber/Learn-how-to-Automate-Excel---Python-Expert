@@ -1,0 +1,72 @@
+def launch_ui() -> tuple:
+    root = tk.Tk()
+    root.title("Comparison Report — Setup")
+    root.resizable(False, False)
+    root.geometry("500x210")
+
+    # ── centre on screen ──────────────────────────────────────────────────────
+    root.update_idletasks()
+    x = (root.winfo_screenwidth()  - 500) // 2
+    y = (root.winfo_screenheight() - 210) // 2
+    root.geometry(f"500x210+{x}+{y}")
+
+    selected_pfx  = tk.StringVar(value="REFFFF")
+    selected_file = tk.StringVar(value="")
+
+    pad = {"padx": 15, "pady": 6}
+
+    # ── Row 0: PFX dropdown ───────────────────────────────────────────────────
+    tk.Label(root, text="REFFFFFF", font=("Arial", 10, "bold")).grid(
+        row=0, column=0, sticky="w", **pad)
+    pfx_combo = ttk.Combobox(
+        root, textvariable=selected_pfx,
+        values=[REFFFFF],          # ← add more options here if needed
+        state="readonly", width=12,
+    )
+    pfx_combo.grid(row=0, column=1, sticky="w", **pad)
+
+    # ── Row 1 + 2: file browser ───────────────────────────────────────────────
+    tk.Label(root, text="Comparison File (.xlsm / .xlsx):", font=("Arial", 10, "bold")).grid(
+        row=1, column=0, sticky="w", **pad)
+
+    def browse():
+        path = filedialog.askopenfilename(
+            title="Select comparison file",
+            filetypes=[("Excel files", "*.xlsm *.xlsx"), ("All files", "*.*")],
+        )
+        if path:
+            selected_file.set(path)
+
+    file_entry = tk.Entry(root, textvariable=selected_file, width=38, state="readonly")
+    file_entry.grid(row=2, column=0, sticky="ew", padx=15, pady=2)
+    tk.Button(root, text="Browse…", command=browse, width=9).grid(
+        row=2, column=1, padx=10, pady=2)
+
+    # ── Row 3: Run / Cancel buttons ───────────────────────────────────────────
+    confirmed = [False]
+
+    def on_run():
+        if not selected_file.get():
+            messagebox.showwarning("Missing File",
+                "Please select a comparison file (.xlsm or .xlsx) before continuing.")
+            return
+        confirmed[0] = True
+        root.destroy()
+
+    def on_cancel():
+        root.destroy()
+
+    btn_frame = tk.Frame(root)
+    btn_frame.grid(row=3, column=0, columnspan=2, pady=15)
+    tk.Button(btn_frame, text="▶  Run", width=12, command=on_run,
+              bg="#2E75B6", fg="white", font=("Arial", 10, "bold")).pack(side="left", padx=10)
+    tk.Button(btn_frame, text="Cancel",  width=10, command=on_cancel).pack(side="left", padx=10)
+
+    root.mainloop()
+
+    if not confirmed[0]:
+        print("Cancelled by user — exiting.")
+        exit()
+
+    return selected_pfx.get(), selected_file.get()
+# ══════════════════════════════════════════════════════════════════════════════
