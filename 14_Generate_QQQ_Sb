@@ -1,69 +1,15 @@
-# =============================================================================
-# DDDD PROCESSOR — PRAC removal logic -IM HERE
-# =============================================================================
+import pandas as pd
 
+# Define your data
+data = {
+    "Name": ["Alice", "Bob", "Charlie"],
+    "Age": [25, 30, 35],
+    "Department": ["IT", "HR", "Finance"]
+}
 
-def _kw_pattern(keywords: list[str]) -> re.Pattern | None:
-    # Joins the keyword list into one compiled regex  (e.g. "PEDS|PEDIATRIC|CHILD").
-    # Returns None when the list is empty — callers treat None as "no match".
-    terms = [k.strip() for k in keywords if k.strip()]
-    if not terms:
-        return None
-    return re.compile("|".join(re.escape(t) for t in terms), re.IGNORECASE)
+# Convert data into a DataFrame (table)
+df = pd.DataFrame(data)
 
-
-def _col_matches(df: pd.DataFrame, col: str, pattern: re.Pattern | None) -> pd.Series:
-    # Returns a boolean Series: True where df[col] contains the pattern.
-    # Returns all-False when pattern is None (empty keyword list → nothing removed).
-    if pattern is None:
-        return pd.Series(False, index=df.index)
-    return df[col].str.contains(pattern, na=False)
-
-
-def apply_prac_removals(
-    df_prac: pd.DataFrame, settings: dict
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Run every PRAC removal rule in order.
-    Returns (kept_df, removed_df).
-    removed_df has all the same columns as df_prac plus a 'Reason' column.
-    """
-
-    # ── Load settings ──────────────────────────────────────────────────
-    # Each variable maps to one key in dsnp_settings.json.
-    # Add new variables here when you add rules that need new settings.
-    # ───────────────────────────────────────────────────────────────────
-    pcp_codes   = set(settings.get("pcp_specialty_code") or [])           
-    pediatric_p = _kw_pattern(settings.get("pediatric_keywords") or [])   # regex or None
-    primary_p   = _kw_pattern(settings.get("primary_care_keywords") or [])
-    specialty_p = _kw_pattern(settings.get("specialty_keywords") or [])
-    inpatient_p = _kw_pattern(settings.get("inpatient_hospitalist_keywords") or [])
-    excl_tins   = set(settings.get("exclusion_tin") or [])                 # exact-match set
-    deact_npis  = set(settings.get("deactivated_npi") or [])
-    excl_groups = set(settings.get("pcp_exclusion_group_name_list") or [])
-    custom_excl = settings.get("pcp_custom_exclusion") or []              # list of dicts
-
-    # PCP Custom Exclusion is stored as [{NPI, Address, LocationName}, ...].
-    # Convert to a set of tuples for fast O(1) membership lookup.
-    custom_excl_set = {
-        (
-            str(e.get(#REF)).strip().upper(),
-            str(e.get(#REF)).strip().upper(),
-            str(e.get(#REF)).strip().upper(),
-        )
-        for e in custom_excl
-    }
-
-    # ── Internal state ─────────────────────────────────────────────────
-    remaining: pd.DataFrame     = df_prac.copy()   # shrinks with every _remove() call
-    removed_parts: list[pd.DataFrame] = []
-
-    def _remove(mask: pd.Series, reason: str) -> None:
-        # Pulls rows where mask=True out of `remaining`, tags them with
-        # the reason string, and saves them.  Modifies `remaining` in place.
-        nonlocal remaining
-        hits = remaining[mask].copy()
-        if not hits.empty:
-            hits.insert(len(hits.columns), "Reason", reason)
-            removed_parts.append(hits)
-            remaining = remaining[~mask].copy()
+# Save to Excel
+df.to_excel("employees.xlsx", index=False)
+print("File 'employees.xlsx' created successfully!")
