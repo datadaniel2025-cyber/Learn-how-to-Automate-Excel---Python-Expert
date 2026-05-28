@@ -1,161 +1,84 @@
+# =============================================================================
+# SHARED — VALIDATORS & FILE LOADING
+# =============================================================================
 
-import json
-import re
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from datetime import date, timedelta
-from pathlib import Path
+def validate_excel_file(path: str) -> tuple[bool, str]:
+    """
+    Confirm the file has both required sheets and all required columns.
+    Returns (is_valid, error_message). error_message is empty when valid.
+    """
+    try:
+        xl = pd.ExcelFile(path)
+    except Exception as exc:
+        return False, f"Could not open file:\n{exc}"
 
-import openpyxl
-import pandas as pd
+    # Check both sheets are present
+    missing_sheets = [s for s in _SHEET_COLUMNS if s not in xl.sheet_names]
+    if missing_sheets:
+        names = "\n".join(f"  • {s}" for s in missing_sheets)
+        return False, f"The following required sheet(s) are missing from the file:\n\n{names}"
+
+    # Check required columns in each sheet (header row only — no data loaded)
+    column_errors: list[str] = []
+    for sheet, required in _SHEET_COLUMNS.items():
+        actual = list(pd.read_excel(xl, sheet_name=sheet, nrows=0).columns)
+        missing = [c for c in required if c not in actual]
+        if missing:
+            cols = "\n".join(f"    • {c}" for c in missing)
+            column_errors.append(
+                f"Sheet '{sheet}' is missing {len(missing)} required column(s):\n{cols}"
+            )
+
+    if column_errors:
+        return False, "Column validation failed:\n\n" + "\n\n".join(column_errors)
+
+    return True, ""
+
+
+def load_sheets(path: str) -> dict[str, pd.DataFrame]:
+    """
+    Load PRAC and FAC sheets trimmed to required columns in defined order.
+    Columns in _TEXT_AS_IS_COLUMNS are forced to dtype=str at read time so
+    leading zeros (e.g. SpecialtyCode 001) are never lost.
+    Always call validate_excel_file first.
+    """
+    xl = pd.ExcelFile(path)
+    result = {}
+    for sheet, required in _SHEET_COLUMNS.items():
+        dtype_map = {col: str for col in required if col in _TEXT_AS_IS_COLUMNS}
+        df = pd.read_excel(xl, sheet_name=sheet, dtype=dtype_map)
+        result[sheet] = df[required]
+    return result
 
 
 # =============================================================================
-# CONSTANTS — Required columns per sheet
+# SHARED — STANDARDIZATION
 # =============================================================================
 
-PRAC_REQUIRED_COLUMNS: list[str] = [
-   #REFFF
-]
-
-FAC_REQUIRED_COLUMNS: list[str] = [
-   #REFFF
-]
-
-_SHEET_COLUMNS: dict[str, list[str]] = {
-    "PRAC": PRAC_REQUIRED_COLUMNS,
-    "FAC":  FAC_REQUIRED_COLUMNS,
-}
+# Columns that must stay as text to preserve leading zeros
+_TEXT_AS_IS_COLUMNS = {"#REFFF"}
 
 
-# =============================================================================
-# SETTINGS MANAGER
-# =============================================================================
-
-_CONFIG_DIR = Path(__file__).parent / "config"
-
-# -----------------------------------------------------------------------------
-# DDDD — config paths, slugs, and per-option defaults
-# To add a new DSNP market: add to dsnp_settings.json "options" list and
-# (optionally) add a slug here if the name has unusual spacing.
-# The fallback slug is: option.lower().replace(" ", "_")
-# -----------------------------------------------------------------------------
-_DSNP_CONFIG_PATH = _CONFIG_DIR / "dsnp_settings.json"   # global options list
-
-_DSNP_OPTION_SLUGS: dict[str, str] = {
-   #REFFF
-}
-
-_DSNP_GLOBAL_DEFAULTS: dict = {"options": [#REFFF]}
-
-_DSNP_OPTION_DEFAULTS: dict = {
-    "output_dir": "output/",
-    "pcp_specialty_code": [],
-    "pediatric_keywords": [],
-    "primary_care_keywords": [],
-    "urgent_care_keywords": [],
-    "inpatient_hospitalist_keywords": [],
-    "specialty_keywords": [],
-    "outpatient_taxonomy_override": [],
-    "pcp_exclusion_list": [],
-    "exclusion_tin": [],
-    "pcp_exclusion_group_name_list": [],
-    "deactivated_npi": [],
-    "pcp_custom_exclusion": [],
-}
-
-# -----------------------------------------------------------------------------
-# QQQQ — config paths, slugs, and per-option defaults
-# Same pattern as DSNP.  Add new QHP markets the same way.
-# -----------------------------------------------------------------------------
-_QHP_CONFIG_PATH = _CONFIG_DIR / "qhp_settings.json"     # global options list
-
-_QHP_OPTION_SLUGS: dict[str, str] = {
-    "#REFFF
-}
-
-_QHP_GLOBAL_DEFAULTS: dict = {"options": [#REFFF]}
-
-_QHP_OPTION_DEFAULTS: dict = {
-    "output_dir": "output/",
-    "pcp_specialty_code": [],
-    "primary_care_keywords": [],
-    "urgent_care_keywords": [],
-    "inpatient_hospitalist_keywords": [],
-    "specialty_keywords": [],
-    "pcp_exclusion_list": [],
-    "exclusion_tin": [],
-    "pcp_exclusion_group_name_list": [],
-    "deactivated_npi": [],
-    "pcp_custom_exclusion": [],
-}
+def standardize_sheet(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Clean a single sheet in-place (returns a new DataFrame):
+      1. Keep only the required columns (already done by load_sheets).
+      2. Convert every column to string, preserving leading zeros for
+         text-as-is columns by reading them as str before any coercion.
+      3. Trim leading/trailing whitespace.
+      4. Uppercase all text.
+      5. Replace 'NAN' / 'NONE' strings (pandas artefacts) back to blank.
+    """
+    result = df.copy()
+    for col in result.columns:
+        # Convert to object/string — blanks become the literal 'nan' from pandas
+        result[col] = result[col].astype(str)
+        result[col] = result[col].str.strip().str.upper()
+        # Restore blanks: pandas converts NaN → 'NAN' after astype(str)
+        result[col] = result[col].replace({"NAN": "", "NONE": "", "NAT": ""})
+    return result
 
 
-class SettingsManager:
-    def __init__(self):
-        self._dsnp_global = self._load(_DSNP_CONFIG_PATH, _DSNP_GLOBAL_DEFAULTS)
-        # Load one dict per DDDD option from its own JSON file
-        self._dsnp_opts: dict[str, dict] = {}
-        for option in self._dsnp_global.get("options", list(_DSNP_OPTION_SLUGS)):
-            slug = _DSNP_OPTION_SLUGS.get(option, option.lower().replace(" ", "_"))
-            path = _CONFIG_DIR / f"{slug}_settings.json"
-            self._dsnp_opts[option] = self._load(path, dict(_DSNP_OPTION_DEFAULTS))
-        self._qhp_global = self._load(_QHP_CONFIG_PATH, _QHP_GLOBAL_DEFAULTS)
-        self._qhp_opts: dict[str, dict] = {}
-        for option in self._qhp_global.get("options", list(_QHP_OPTION_SLUGS)):
-            slug = _QHP_OPTION_SLUGS.get(option, option.lower().replace(" ", "_"))
-            path = _CONFIG_DIR / f"{slug}_settings.json"
-            self._qhp_opts[option] = self._load(path, dict(_QHP_OPTION_DEFAULTS))
-
-    @staticmethod
-    def _load(path: Path, defaults: dict) -> dict:
-        if path.exists():
-            with path.open("r") as f:
-                return json.load(f)
-        return dict(defaults)
-
-    def get(self, section: str, key: str = None):
-        """Global (options-list only) settings for DSNP or QHP."""
-        data = self._dsnp_global if section == "dsnp" else self._qhp_global
-        return data.get(key) if key else data
-
-    def get_dsnp(self, option: str, key: str = None):
-        """Per-option DSNP settings (keywords, exclusions, etc.)."""
-        data = self._dsnp_opts.get(option, {})
-        return data.get(key) if key else data
-
-    def get_qhp(self, option: str, key: str = None):
-        """Per-option QHP settings."""
-        data = self._qhp_opts.get(option, {})
-        return data.get(key) if key else data
-
-    def set(self, section: str, key: str, value):
-        """Save global settings."""
-        if section == "dsnp":
-            self._dsnp_global[key] = value
-            self._save(_DSNP_CONFIG_PATH, self._dsnp_global)
-        else:
-            self._qhp_global[key] = value
-            self._save(_QHP_CONFIG_PATH, self._qhp_global)
-
-    def set_dsnp(self, option: str, key: str, value):
-        """Save per-option DSNP settings to the option's own JSON file."""
-        if option not in self._dsnp_opts:
-            self._dsnp_opts[option] = dict(_DSNP_OPTION_DEFAULTS)
-        self._dsnp_opts[option][key] = value
-        slug = _DSNP_OPTION_SLUGS.get(option, option.lower().replace(" ", "_"))
-        self._save(_CONFIG_DIR / f"{slug}_settings.json", self._dsnp_opts[option])
-
-    def set_qhp(self, option: str, key: str, value):
-        """Save per-option QHP settings to the option's own JSON file."""
-        if option not in self._qhp_opts:
-            self._qhp_opts[option] = dict(_QHP_OPTION_DEFAULTS)
-        self._qhp_opts[option][key] = value
-        slug = _QHP_OPTION_SLUGS.get(option, option.lower().replace(" ", "_"))
-        self._save(_CONFIG_DIR / f"{slug}_settings.json", self._qhp_opts[option])
-
-    @staticmethod
-    def _save(path: Path, data: dict):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w") as f:
-            json.dump(data, f, indent=2)
+def standardize_sheets(sheets: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """Apply standardize_sheet to every sheet in the dict."""
+    return {name: standardize_sheet(df) for name, df in sheets.items()}
