@@ -1,84 +1,69 @@
 # =============================================================================
-# SHARED — VALIDATORS & FILE LOADING
+# DDDD PROCESSOR — PRAC removal logic -IM HERE
 # =============================================================================
 
-def validate_excel_file(path: str) -> tuple[bool, str]:
+
+def _kw_pattern(keywords: list[str]) -> re.Pattern | None:
+    # Joins the keyword list into one compiled regex  (e.g. "PEDS|PEDIATRIC|CHILD").
+    # Returns None when the list is empty — callers treat None as "no match".
+    terms = [k.strip() for k in keywords if k.strip()]
+    if not terms:
+        return None
+    return re.compile("|".join(re.escape(t) for t in terms), re.IGNORECASE)
+
+
+def _col_matches(df: pd.DataFrame, col: str, pattern: re.Pattern | None) -> pd.Series:
+    # Returns a boolean Series: True where df[col] contains the pattern.
+    # Returns all-False when pattern is None (empty keyword list → nothing removed).
+    if pattern is None:
+        return pd.Series(False, index=df.index)
+    return df[col].str.contains(pattern, na=False)
+
+
+def apply_prac_removals(
+    df_prac: pd.DataFrame, settings: dict
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Confirm the file has both required sheets and all required columns.
-    Returns (is_valid, error_message). error_message is empty when valid.
+    Run every PRAC removal rule in order.
+    Returns (kept_df, removed_df).
+    removed_df has all the same columns as df_prac plus a 'Reason' column.
     """
-    try:
-        xl = pd.ExcelFile(path)
-    except Exception as exc:
-        return False, f"Could not open file:\n{exc}"
 
-    # Check both sheets are present
-    missing_sheets = [s for s in _SHEET_COLUMNS if s not in xl.sheet_names]
-    if missing_sheets:
-        names = "\n".join(f"  • {s}" for s in missing_sheets)
-        return False, f"The following required sheet(s) are missing from the file:\n\n{names}"
+    # ── Load settings ──────────────────────────────────────────────────
+    # Each variable maps to one key in dsnp_settings.json.
+    # Add new variables here when you add rules that need new settings.
+    # ───────────────────────────────────────────────────────────────────
+    pcp_codes   = set(settings.get("pcp_specialty_code") or [])           
+    pediatric_p = _kw_pattern(settings.get("pediatric_keywords") or [])   # regex or None
+    primary_p   = _kw_pattern(settings.get("primary_care_keywords") or [])
+    specialty_p = _kw_pattern(settings.get("specialty_keywords") or [])
+    inpatient_p = _kw_pattern(settings.get("inpatient_hospitalist_keywords") or [])
+    excl_tins   = set(settings.get("exclusion_tin") or [])                 # exact-match set
+    deact_npis  = set(settings.get("deactivated_npi") or [])
+    excl_groups = set(settings.get("pcp_exclusion_group_name_list") or [])
+    custom_excl = settings.get("pcp_custom_exclusion") or []              # list of dicts
 
-    # Check required columns in each sheet (header row only — no data loaded)
-    column_errors: list[str] = []
-    for sheet, required in _SHEET_COLUMNS.items():
-        actual = list(pd.read_excel(xl, sheet_name=sheet, nrows=0).columns)
-        missing = [c for c in required if c not in actual]
-        if missing:
-            cols = "\n".join(f"    • {c}" for c in missing)
-            column_errors.append(
-                f"Sheet '{sheet}' is missing {len(missing)} required column(s):\n{cols}"
-            )
+    # PCP Custom Exclusion is stored as [{NPI, Address, LocationName}, ...].
+    # Convert to a set of tuples for fast O(1) membership lookup.
+    custom_excl_set = {
+        (
+            str(e.get(#REF)).strip().upper(),
+            str(e.get(#REF)).strip().upper(),
+            str(e.get(#REF)).strip().upper(),
+        )
+        for e in custom_excl
+    }
 
-    if column_errors:
-        return False, "Column validation failed:\n\n" + "\n\n".join(column_errors)
+    # ── Internal state ─────────────────────────────────────────────────
+    remaining: pd.DataFrame     = df_prac.copy()   # shrinks with every _remove() call
+    removed_parts: list[pd.DataFrame] = []
 
-    return True, ""
-
-
-def load_sheets(path: str) -> dict[str, pd.DataFrame]:
-    """
-    Load PRAC and FAC sheets trimmed to required columns in defined order.
-    Columns in _TEXT_AS_IS_COLUMNS are forced to dtype=str at read time so
-    leading zeros (e.g. SpecialtyCode 001) are never lost.
-    Always call validate_excel_file first.
-    """
-    xl = pd.ExcelFile(path)
-    result = {}
-    for sheet, required in _SHEET_COLUMNS.items():
-        dtype_map = {col: str for col in required if col in _TEXT_AS_IS_COLUMNS}
-        df = pd.read_excel(xl, sheet_name=sheet, dtype=dtype_map)
-        result[sheet] = df[required]
-    return result
-
-
-# =============================================================================
-# SHARED — STANDARDIZATION
-# =============================================================================
-
-# Columns that must stay as text to preserve leading zeros
-_TEXT_AS_IS_COLUMNS = {"#REFFF"}
-
-
-def standardize_sheet(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Clean a single sheet in-place (returns a new DataFrame):
-      1. Keep only the required columns (already done by load_sheets).
-      2. Convert every column to string, preserving leading zeros for
-         text-as-is columns by reading them as str before any coercion.
-      3. Trim leading/trailing whitespace.
-      4. Uppercase all text.
-      5. Replace 'NAN' / 'NONE' strings (pandas artefacts) back to blank.
-    """
-    result = df.copy()
-    for col in result.columns:
-        # Convert to object/string — blanks become the literal 'nan' from pandas
-        result[col] = result[col].astype(str)
-        result[col] = result[col].str.strip().str.upper()
-        # Restore blanks: pandas converts NaN → 'NAN' after astype(str)
-        result[col] = result[col].replace({"NAN": "", "NONE": "", "NAT": ""})
-    return result
-
-
-def standardize_sheets(sheets: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
-    """Apply standardize_sheet to every sheet in the dict."""
-    return {name: standardize_sheet(df) for name, df in sheets.items()}
+    def _remove(mask: pd.Series, reason: str) -> None:
+        # Pulls rows where mask=True out of `remaining`, tags them with
+        # the reason string, and saves them.  Modifies `remaining` in place.
+        nonlocal remaining
+        hits = remaining[mask].copy()
+        if not hits.empty:
+            hits.insert(len(hits.columns), "Reason", reason)
+            removed_parts.append(hits)
+            remaining = remaining[~mask].copy()
