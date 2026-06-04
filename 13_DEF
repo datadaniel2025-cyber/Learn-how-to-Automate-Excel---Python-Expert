@@ -1,1 +1,40 @@
+def manipulating_prac(df: pd.DataFrame) -> pd.DataFrame:
+    PCP_SPECS_ALL  = {}
+    PCP_SPECS_CORE = {}
+    MID_LEVEL      = {}
+
+    out = df.copy()
+
+    orig_spec = out['QES_SPECIALTY_CODE'].astype(str).str.strip()
+    pcp_ind   = out['PCP_INDICATOR'].astype(str).str.strip().str.upper()
+    acc_new   = out['ACC_NEW_PATIENTS'].astype(str).str.strip().str.upper()
+    prov_deg  = out['PROV_DEGREE'].astype(str).str.strip().str.upper()
+
+    qes_cols = ['QES_SPECIALTY_CODE', 'QES_SPECIALTY_TYPE', 'QES_POPULATION']
+
+    # Rule 2 applied first (lower priority — Rule 1 can override below)
+    mask2 = orig_spec.isin(PCP_SPECS_ALL) & (acc_new == 'N')
+    out.loc[mask2, qes_cols] = 'PCP NOT ACCEPT NEW PATIENT'
+
+    # Rule 1 applied second (higher priority — overrides Rule 2 when both match)
+    mask1 = orig_spec.isin(PCP_SPECS_ALL) & (pcp_ind == 'N')
+    out.loc[mask1, qes_cols] = 'PCP INDICATOR = N'
+
+    # Rule 3 — PCP_INDICATOR=Y and ACC_NEW_PATIENTS=Y, so no overlap with Rules 1/2
+    mask3 = (
+        orig_spec.isin(PCP_SPECS_CORE)
+        & (pcp_ind == 'Y')
+        & (acc_new == 'Y')
+        & prov_deg.isin(MID_LEVEL)
+    )
+    out.loc[mask3, qes_cols] = 'PCP WITH MID LV DEGREE'
+
+    # 3C_OR_2C_STATUS
+    agag   = out['AGAG_ID'].astype(str).str.strip().str.upper()
+    status = agag.apply(lambda x: '2C' if 'PNDCRED' in x else '3C')
+    is_na  = out['QES_SPECIALTY_CODE'].astype(str).str.strip() == 'N/A'
+    status[is_na] = 'N/A'
+    out['3C_OR_2C_STATUS'] = status
+
+    return out
 
