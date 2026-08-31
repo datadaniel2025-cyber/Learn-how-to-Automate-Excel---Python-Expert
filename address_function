@@ -1,0 +1,104 @@
+def add_practice_address_columns(
+    df: pd.DataFrame,
+    bypass_list: Iterable[str] = frozenset({"20/20 INC"}),
+) -> pd.DataFrame:
+  
+    street_suffixes = {
+        "ST", "STREET", "AVE", "AVENUE", "AV", "RD", "ROAD", "DR", "DRIVE",
+        "LN", "LANE", "BLVD", "BOULEVARD", "CT", "COURT", "PL", "PLACE",
+        "PIKE", "WAY", "HWY", "HIGHWAY", "CIR", "CIRCLE", "TER", "TERR",
+        "TERRACE", "PKWY", "PARKWAY", "TRL", "TRAIL", "SQ", "SQUARE",
+        "LOOP", "ALY", "ALLEY", "PATH", "ROW", "PLAZA", "PLZ", "POINT",
+        "PT", "PARK", "EXT", "EXTENSION", "CRES", "CRESCENT", "GLEN",
+        "RUN", "BEND", "COVE", "CV", "CROSSING", "XING", "EXPY",
+        "EXPRESSWAY", "FWY", "FREEWAY",
+    }
+    address_pattern = re.compile(
+        r"\b\d+\s+[A-Za-z0-9.'-]+(?:\s+[A-Za-z0-9.'-]+){0,3}\s+(?:"
+        + "|".join(sorted(street_suffixes, key=len, reverse=True))
+        + r")\b",
+        re.IGNORECASE,
+    )
+    starts_with_number_pattern = re.compile(r"^\s*\d")
+
+    # Unit/suite/apartment designators that can trail a street address
+    # (e.g. "Suite 276", "Apt 5B", "Unit 12", "#200"). Extend this list
+    # for other datasets as needed.
+    unit_keywords = (
+        "suite", "ste", "apt", "apartment", "unit", "bldg", "building",
+        "fl", "floor", "rm", "room", "dept", "department",
+    )
+
+    
+    unit_pattern = re.compile(
+        r"[,\s]*(?:\b(?:" + "|".join(unit_keywords) + r")\b\.?\s*#?\s*[A-Za-z0-9-]+"
+        r"|#\s*[A-Za-z0-9-]+)",
+        re.IGNORECASE,
+    )
+
+    def normalize(text: Optional[str]) -> str:
+        """Collapse whitespace and uppercase, for stable comparisons."""
+        if pd.isna(text):
+            return ""
+        return re.sub(r"\s+", " ", str(text).strip()).upper()
+
+    def starts_with_number(text: Optional[str]) -> bool:
+        if pd.isna(text):
+            return False
+        return bool(starts_with_number_pattern.match(str(text)))
+
+    def looks_like_address(text: Optional[str]) -> bool:
+        """True if `text` contains a recognizable street-address pattern:
+        a leading number, one to four words, then a known street suffix
+        (e.g. "467 Lancaster Ave"). A bare suite/unit number such as
+        "Suite 302" will not match.
+        """
+        if pd.isna(text):
+            return False
+        return bool(address_pattern.search(str(text)))
+
+    normalized_bypass = {normalize(name) for name in bypass_list}
+
+    def resolve_python_address_1(row: pd.Series) -> Optional[str]:
+        practice_name = row["Practice Name"]
+        address = row["Address"]
+
+        if normalize(practice_name) in normalized_bypass:
+            return address
+
+        if (
+            starts_with_number(practice_name)
+            and looks_like_address(practice_name)
+            and not looks_like_address(address)
+        ):
+            return practice_name
+
+        return address
+
+    def split_secondary_address(text: Optional[str]):
+        """Pull a trailing unit/suite/apartment segment out of `text`.
+
+        Returns (primary, secondary): `secondary` is the matched unit
+        info (e.g. "Suite 276") or None if there was nothing to split;
+        `primary` is `text` with that segment removed and stripped.
+        Text with no match is returned unchanged.
+        """
+        if pd.isna(text):
+            return text, None
+        match = unit_pattern.search(str(text))
+        if not match:
+            return text, None
+        secondary = match.group().strip(" ,")
+        primary = (str(text)[: match.start()] + str(text)[match.end() :]).strip(" ,")
+        return primary, secondary
+
+    df = df.copy()
+    address_1_raw = df.apply(resolve_python_address_1, axis=1)
+    split = address_1_raw.apply(split_secondary_address)
+    df["Python Address 1"] = split.apply(lambda pair: pair[0])
+    df["Python Address 2"] = split.apply(lambda pair: pair[1])
+
+    remaining = [c for c in df.columns if c not in ("Python Address 1", "Python Address 2")]
+    insert_at = remaining.index("Address") + 1
+    new_order = remaining[:insert_at] + ["Python Address 1", "Python Address 2"] + remaining[insert_at:]
+    return df[new_order]
