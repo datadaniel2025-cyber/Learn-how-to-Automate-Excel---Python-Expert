@@ -1,0 +1,370 @@
+import pandas as pd
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+ADEQUACY_FILE = "xxx"
+GAPFILL_FILE = "xxx.xlsx"
+OUTPUT_FILE = "xxx.xlsx"
+
+# Gapfill header is on Excel row 10
+GAPFILL_HEADER = 9
+
+
+# ============================================================
+# COLUMN NAMES
+# Change column names ONLY HERE if Excel changes
+# ============================================================
+
+# Adequacy columns
+ADEQ_COUNTY = "xxx"
+ADEQ_SPECIALTY = "xxx"
+ACCESS = "xxx"
+MET = "xxx"
+FILLABLE = "xxx"
+
+# Gapfill provider columns
+GAP_COUNTY = "xxx"
+GAP_SPECIALTY = "xxx"
+GAIN = "xxx"
+
+
+# ============================================================
+# BUSINESS RULES
+# ============================================================
+
+# Keep 0% Gain for these specialties
+KEEP_ZERO_SPECIALTIES = {
+    "xxx",
+    "xxx"
+}
+
+# Priority based on Fillable Gap Indicator
+PRIORITY_MAP = {
+    "xxx": 1,
+    "xxx": 2,
+    "xxx": 3
+}
+
+
+# ============================================================
+# FUNCTIONS
+# ============================================================
+
+def clean_text(df, columns):
+    """
+    Trim spaces and convert selected columns to uppercase.
+    """
+    for col in columns:
+        df[col] = (
+            df[col]
+            .astype(str)
+            .str.strip()
+            .str.upper()
+        )
+
+    return df
+
+
+def load_data():
+    """
+    Read adequacy and gapfill provider files.
+    """
+
+    adequacy = pd.read_excel(
+        ADEQUACY_FILE
+    )
+
+    # Header starts on Excel row 10
+    gapfill = pd.read_excel(
+        GAPFILL_FILE,
+        header=GAPFILL_HEADER
+    )
+
+    # Clean column names
+    adequacy.columns = (
+        adequacy.columns
+        .astype(str)
+        .str.strip()
+    )
+
+    gapfill.columns = (
+        gapfill.columns
+        .astype(str)
+        .str.strip()
+    )
+
+    return adequacy, gapfill
+
+
+def prepare_data(adequacy, gapfill):
+    """
+    Clean joining fields and numeric fields.
+    """
+
+    # Clean adequacy fields
+    adequacy = clean_text(
+        adequacy,
+        [
+            ADEQ_COUNTY,
+            ADEQ_SPECIALTY,
+            MET
+        ]
+    )
+
+    # Clean gapfill fields
+    gapfill = clean_text(
+        gapfill,
+        [
+            GAP_COUNTY,
+            GAP_SPECIALTY
+        ]
+    )
+
+    # Convert percentage fields to numeric
+    adequacy[ACCESS] = pd.to_numeric(
+        adequacy[ACCESS],
+        errors="coerce"
+    )
+
+    gapfill[GAIN] = pd.to_numeric(
+        gapfill[GAIN],
+        errors="coerce"
+    )
+
+    return adequacy, gapfill
+
+
+def get_gaps(adequacy):
+    """
+    Keep only gaps where Met Overall = N
+    and assign gap priority.
+    """
+
+    gaps = adequacy[
+        adequacy[MET] == "N"
+    ].copy()
+
+    gaps["Priority"] = (
+        gaps[FILLABLE]
+        .map(PRIORITY_MAP)
+        .fillna(99)
+        .astype(int)
+    )
+
+    return gaps
+
+
+def merge_data(gapfill, gaps):
+    """
+    Join gapfill provider data to adequacy gaps
+    using County + Specialty.
+    """
+
+    result = gapfill.merge(
+        gaps[
+            [
+                ADEQ_COUNTY,
+                ADEQ_SPECIALTY,
+                ACCESS,
+                MET,
+                FILLABLE,
+                "Priority"
+            ]
+        ],
+
+        left_on=[
+            GAP_COUNTY,
+            GAP_SPECIALTY
+        ],
+
+        right_on=[
+            ADEQ_COUNTY,
+            ADEQ_SPECIALTY
+        ],
+
+        how="inner"
+    )
+
+    return result
+
+
+def filter_providers(df):
+    """
+    Autism and OB/GYN:
+        keep providers even when Gain = 0
+
+    All other specialties:
+        only keep providers where Gain > 0
+    """
+
+    keep_zero = (
+        df[GAP_SPECIALTY]
+        .isin(KEEP_ZERO_SPECIALTIES)
+    )
+
+    positive_gain = (
+        df[GAIN]
+        .fillna(0)
+        > 0
+    )
+
+    return df[
+        keep_zero | positive_gain
+    ].copy()
+
+
+def prioritize(df):
+    """
+    Rank providers and sort the final output.
+    """
+
+    # Rank providers within each County + Specialty
+    df["Provider Gain Rank"] = (
+        df
+        .groupby(
+            [
+                GAP_COUNTY,
+                GAP_SPECIALTY
+            ]
+        )[GAIN]
+        .rank(
+            method="dense",
+            ascending=False
+        )
+        .astype("Int64")
+    )
+
+    # Overall sorting
+    df = df.sort_values(
+        by=[
+            "Priority",
+            ACCESS,
+            GAIN
+        ],
+        ascending=[
+            True,
+            False,
+            False
+        ]
+    )
+
+    return df
+
+
+def clean_sheet_name(name):
+    """
+    Make specialty name valid for an Excel sheet.
+
+    Excel sheet names:
+    - max 31 characters
+    - cannot contain \ / * ? : [ ]
+    """
+
+    name = str(name)
+
+    invalid_chars = [
+        "\\",
+        "/",
+        "*",
+        "?",
+        ":",
+        "[",
+        "]"
+    ]
+
+    for char in invalid_chars:
+        name = name.replace(
+            char,
+            "-"
+        )
+
+    return name[:31]
+
+
+def export_by_specialty(df):
+    """
+    Export one Excel tab for each unique specialty.
+    """
+
+    with pd.ExcelWriter(
+        OUTPUT_FILE,
+        engine="openpyxl"
+    ) as writer:
+
+        # Loop through each specialty
+        for specialty, specialty_df in df.groupby(
+            ADEQ_SPECIALTY,
+            dropna=False
+        ):
+
+            sheet_name = clean_sheet_name(
+                specialty
+            )
+
+            specialty_df.to_excel(
+                writer,
+                sheet_name=sheet_name,
+                index=False
+            )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    # Load files
+    adequacy, gapfill = load_data()
+
+    # Clean data
+    adequacy, gapfill = prepare_data(
+        adequacy,
+        gapfill
+    )
+
+    # Get not-met gaps
+    gaps = get_gaps(
+        adequacy
+    )
+
+    # Join provider data
+    result = merge_data(
+        gapfill,
+        gaps
+    )
+
+    # Apply Gain % rules
+    result = filter_providers(
+        result
+    )
+
+    # Rank and prioritize
+    result = prioritize(
+        result
+    )
+
+    # Export one tab per specialty
+    export_by_specialty(
+        result
+    )
+
+    # Summary
+    print("Completed successfully.")
+    print(f"Output file: {OUTPUT_FILE}")
+    print(f"Rows exported: {len(result):,}")
+    print(
+        f"Specialty tabs created: "
+        f"{result[ADEQ_SPECIALTY].nunique()}"
+    )
+
+
+# ============================================================
+# RUN PROGRAM
+# ============================================================
+
+if __name__ == "__main__":
+    main()
