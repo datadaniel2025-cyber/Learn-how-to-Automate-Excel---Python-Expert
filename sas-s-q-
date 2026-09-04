@@ -1,45 +1,74 @@
+
+
+options validvarname=any;
+
 /* ===========================================================================
    USER SETTINGS — edit these for each new run.
    =========================================================================== */
 %let SOURCE_FILE     = xxx;
-%let SOURCE_SHEET    = xxx   /* actual tab name in SOURCE_FILE */
+%let SOURCE_SHEET    =;          /* tab name in SOURCE_FILE, or blank for the first sheet */
 %let HEADER_ROW      = 2;        /* row number the column headers are on */
 
-%let OUTPUT_FILE     = xxx;
+/* Output file name gets today's date stamped on, e.g. PROVIDERSTA_09042026.xlsx */
+%let OUTPUT_DIR      = xxx;
+%let OUTPUT_PREFIX   = PROVIDERSTA_;
+%let _RUN_DATE       = %sysfunc(today(), mmddyyN8.);
+%let OUTPUT_FILE     = &OUTPUT_DIR.\&OUTPUT_PREFIX.&_RUN_DATE..xlsx;
 
 %let XWALK_FILE       = xxx;
-%let XWALK_SHEET      = xxx;  /* actual tab name in XWALK_FILE */
+%let XWALK_SHEET      = Sheet1;  /* actual tab name in XWALK_FILE */
 %let XWALK_HEADER_ROW = 1;
 
 /* Rows with ProviderType = "P" go to OUTPUT_FILE's PRAC sheet, "F" to its
    FAC sheet, and rows with a blank ProviderType (no crosswalk match) go
-   to REMOVED_FILE instead. */
-%let REMOVED_FILE    = xxx;
+   to REMOVED_FILE instead. Also gets today's date stamped on, e.g.
+   remove_Records_09042026.xlsx. */
+%let REMOVED_PREFIX  = remove_Records_;
+%let REMOVED_FILE    = &OUTPUT_DIR.\&REMOVED_PREFIX.&_RUN_DATE..xlsx;
 
 
 /* ===========================================================================
    %namelit(&_tok) with _tok=Practice Name expands to "Practice Name"n.
+   Needed throughout because several source columns have spaces/parens.
    =========================================================================== */
 %macro namelit(v);
 %sysfunc(quote(&v,%str(%")))n
 %mend namelit;
 
 
+/* ---------------------------------------------------------------------------
+   Section 1:reusable — no
+   dependency on any specific workbook's column layout.
+   --------------------------------------------------------------------------- */
+
 /* Read one worksheet into a dataset. header_row is the 1-based row number
    the column headers are on; rows above it (e.g. a title row) are
    skipped automatically by starting the range there. */
 %macro read_sheet_as_ds(path=, libref=, sheet_name=, header_row=1, dsout=);
    libname &libref xlsx "&path.";
+
+   %local _sheet;
+   %if %length(&sheet_name) = 0 %then %do;
+      proc sql noprint;
+         select memname into :_sheet trimmed
+         from dictionary.tables
+         where upcase(libname) = %sysfunc(quote(%upcase(&libref)))
+         ;
+      quit;
+      %put NOTE: sheet_name not specified for &libref -- using first sheet found: &_sheet;
+   %end;
+   %else %do;
+      %let _sheet = &sheet_name;
+   %end;
+
    data &dsout;
-      set &libref.."&sheet_name.$A&header_row.:ZZ100000"n;
+      set &libref.."&_sheet.$A&header_row.:ZZ100000"n;
    run;
    libname &libref clear;
 %mend read_sheet_as_ds;
 
 /* Trim whitespace and uppercase every character column. Missing values
-   are left as-is; numeric/date columns are untouched. Run this right
-   after reading a workbook so every downstream step sees consistently
-   trimmed, upper-case text. */
+   are left as-is; numeric/date columns are untouched. */
 %macro clean_text_columns(dsin=, dsout=);
    %local _dsmember _charvars _n _i _v;
    %let _dsmember = %upcase(%scan(&dsin, -1, %str(.)));
@@ -62,8 +91,8 @@
    run;
 %mend clean_text_columns;
 
-/* Insert new_vars (already-formatted name-literal tokens, e.g.
-   "sas Address 1"n "sas Address 2"n) immediately after anchor_var
+/* Insert new_vars
+   "SAS Address 1"n "SAS Address 2"n) immediately after anchor_var
    in the dataset's column order — the SAS equivalent of Python's column
    reordering after "Address". */
 %macro reorder_after(dsin=, dsout=, anchor_var=, new_vars=);
@@ -96,7 +125,7 @@
 
 
 /* ---------------------------------------------------------------------------
-   detects a likely Practice Name /
+   Section 2: detects a likely Practice Name /
    Address swap and splits off a trailing suite/unit segment. Any dataset
    with "Practice Name" and "Address" columns works.
    --------------------------------------------------------------------------- */
