@@ -1,277 +1,67 @@
-
-
+/*============================================================
+  STEP 1: Allow SAS to read Excel column names with spaces
+============================================================*/
 options validvarname=any;
 
-/* ===========================================================================
-   USER SETTINGS — edit these for each new run.
-   =========================================================================== */
-%let SOURCE_FILE     = xxx;
-%let SOURCE_SHEET    =;          /* tab name in SOURCE_FILE, or blank for the first sheet */
-%let HEADER_ROW      = 2;        /* row number the column headers are on */
 
-/* Output file name gets today's date stamped on, e.g. PROVIDERSTA_09042026.xlsx */
-%let OUTPUT_DIR      = xxx;
-%let OUTPUT_PREFIX   = PROVIDERSTA_;
-%let _RUN_DATE       = %sysfunc(today(), mmddyyN8.);
-%let OUTPUT_FILE     = &OUTPUT_DIR.\&OUTPUT_PREFIX.&_RUN_DATE..xlsx;
+/*============================================================
+  STEP 2: Set file locations
+============================================================*/
 
-%let XWALK_FILE       = xxx;
-%let XWALK_SHEET      = Sheet1;  /* actual tab name in XWALK_FILE */
-%let XWALK_HEADER_ROW = 1;
-
-/* Rows with ProviderType = "P" go to OUTPUT_FILE's PRAC sheet, "F" to its
-   FAC sheet, and rows with a blank ProviderType (no crosswalk match) go
-   to REMOVED_FILE instead. Also gets today's date stamped on, e.g.
-   remove_Records_09042026.xlsx. */
-%let REMOVED_PREFIX  = remove_Records_;
-%let REMOVED_FILE    = &OUTPUT_DIR.\&REMOVED_PREFIX.&_RUN_DATE..xlsx;
+%let source_file = /your/path/source_file.xlsx;
+%let xwalk_file  = /your/path/xwalk_file.xlsx;
 
 
-/* ===========================================================================
-   %namelit(&_tok) with _tok=Practice Name expands to "Practice Name"n.
-   Needed throughout because several source columns have spaces/parens.
-   =========================================================================== */
-%macro namelit(v);
-%sysfunc(quote(&v,%str(%")))n
-%mend namelit;
+/*============================================================
+  STEP 3: Read SOURCE file
+============================================================*/
+
+proc import datafile="&source_file."
+    out=work.source
+    dbms=xlsx
+    replace;
+    getnames=yes;
+run;
 
 
-/* ---------------------------------------------------------------------------
-   Section 1:reusable — no
-   dependency on any specific workbook's column layout.
-   --------------------------------------------------------------------------- */
+/*============================================================
+  STEP 4: Read XWALK file
+============================================================*/
 
-/* Read one worksheet into a dataset. header_row is the 1-based row number
-   the column headers are on; rows above it (e.g. a title row) are
-   skipped automatically by starting the range there. */
-%macro read_sheet_as_ds(path=, libref=, sheet_name=, header_row=1, dsout=);
-   libname &libref xlsx "&path.";
-
-   %local _sheet;
-   %if %length(&sheet_name) = 0 %then %do;
-      proc sql noprint;
-         select memname into :_sheet trimmed
-         from dictionary.tables
-         where upcase(libname) = %sysfunc(quote(%upcase(&libref)))
-         ;
-      quit;
-      %put NOTE: sheet_name not specified for &libref -- using first sheet found: &_sheet;
-   %end;
-   %else %do;
-      %let _sheet = &sheet_name;
-   %end;
-
-   data &dsout;
-      set &libref.."&_sheet.$A&header_row.:ZZ100000"n;
-   run;
-   libname &libref clear;
-%mend read_sheet_as_ds;
-
-/* Trim whitespace and uppercase every character column. Missing values
-   are left as-is; numeric/date columns are untouched. */
-%macro clean_text_columns(dsin=, dsout=);
-   %local _dsmember _charvars _n _i _v;
-   %let _dsmember = %upcase(%scan(&dsin, -1, %str(.)));
-
-   proc sql noprint;
-      select name into :_charvars separated by '|'
-      from dictionary.columns
-      where libname='WORK' and memname=%sysfunc(quote(&_dsmember)) and type='char';
-   quit;
-
-   %let _n = %sysfunc(countw(&_charvars, %str(|)));
-
-   data &dsout;
-      set &dsin;
-      %do _i = 1 %to &_n;
-         %let _v = %scan(&_charvars, &_i, %str(|));
-         if not missing(%namelit(&_v)) then
-            %namelit(&_v) = upcase(strip(%namelit(&_v)));
-      %end;
-   run;
-%mend clean_text_columns;
-
-/* Insert new_vars
-   "SAS Address 1"n "SAS Address 2"n) immediately after anchor_var
-   in the dataset's column order — the SAS equivalent of Python's column
-   reordering after "Address". */
-%macro reorder_after(dsin=, dsout=, anchor_var=, new_vars=);
-   %local _dsmember _anchor_upper _allvars _n _i _tok _final_order;
-   %let _dsmember     = %upcase(%scan(&dsin, -1, %str(.)));
-   %let _anchor_upper = %upcase(&anchor_var);
-
-   proc sql noprint;
-      select name into :_allvars separated by '|'
-      from dictionary.columns
-      where libname='WORK' and memname=%sysfunc(quote(&_dsmember))
-      order by varnum;
-   quit;
-
-   %let _n = %sysfunc(countw(&_allvars, %str(|)));
-   %let _final_order =;
-   %do _i = 1 %to &_n;
-      %let _tok = %scan(&_allvars, &_i, %str(|));
-      %let _final_order = &_final_order %namelit(&_tok);
-      %if %upcase(&_tok) = &_anchor_upper %then %do;
-         %let _final_order = &_final_order &new_vars;
-      %end;
-   %end;
-
-   data &dsout;
-      retain &_final_order;
-      set &dsin;
-   run;
-%mend reorder_after;
+proc import datafile="&xwalk_file."
+    out=work.xwalk
+    dbms=xlsx
+    replace;
+    getnames=yes;
+run;
 
 
-/* ---------------------------------------------------------------------------
-   Section 2: detects a likely Practice Name /
-   Address swap and splits off a trailing suite/unit segment. Any dataset
-   with "Practice Name" and "Address" columns works.
-   --------------------------------------------------------------------------- */
-%macro add_practice_address_columns(dsin=, dsout=, bypass_list=%str('20/20 INC'));
+/*============================================================
+  STEP 5: LEFT JOIN
+============================================================*/
 
-   data &dsout;
-      length "SAS Address 1"n "SAS Address 2"n $400 _paddr1_raw $400 _pname_norm $400;
-      retain _addr_id _num_id _unit_id _trim_id;
-      set &dsin;
+proc sql;
 
-      if _n_ = 1 then do;
-         /* leading number, 1-4 words, then a street suffix, e.g. "467 Lancaster Ave" */
-         _addr_id = prxparse(
-            "/\b\d+\s+[A-Za-z0-9.'-]+(?:\s+[A-Za-z0-9.'-]+){0,3}\s+(?:"
-            || "EXPRESSWAY|BOULEVARD|EXTENSION|CRESCENT|CROSSING|AVENUE|HIGHWAY|"
-            || "TERRACE|PARKWAY|FREEWAY|STREET|CIRCLE|SQUARE|DRIVE|COURT|PLACE|"
-            || "TRAIL|ALLEY|PLAZA|POINT|ROAD|LANE|BLVD|PIKE|TERR|PKWY|LOOP|PATH|"
-            || "PARK|CRES|GLEN|BEND|COVE|XING|EXPY|AVE|WAY|HWY|CIR|TER|TRL|ALY|"
-            || "ROW|PLZ|EXT|RUN|FWY|ST|AV|RD|DR|LN|CT|PL|SQ|PT|CV)\b/i"
-         );
-         _num_id = prxparse("/^\s*\d/");
-         /* trailing suite/apt/unit designator, e.g. "Suite 276", "Apt 5B", "#200" */
-         _unit_id = prxparse(
-            "/[,\s]*(?:\b(?:suite|ste|apt|apartment|unit|bldg|building|fl|floor|"
-            || "rm|room|dept|department)\b\.?\s*#?\s*[A-Za-z0-9-]+"
-            || "|#\s*[A-Za-z0-9-]+)/i"
-         );
-         _trim_id = prxparse("s/^[,\s]+|[,\s]+$//");
-      end;
+    create table work.provider_final as
 
-      _pname_norm = compbl(upcase(strip("Practice Name"n)));
+    select
+        a.*,
+        b.Specialty
 
-      if _pname_norm in (&bypass_list) then
-         _paddr1_raw = "Address"n;
-      else if (missing("Address"n) or upcase(strip("Address"n)) in ('N/A','NA'))
-              and prxmatch(_num_id, strip("Practice Name"n)) > 0 then
-         _paddr1_raw = "Practice Name"n;
-      else if prxmatch(_num_id, strip("Practice Name"n)) > 0
-              and prxmatch(_addr_id, strip("Practice Name"n)) > 0
-              and prxmatch(_addr_id, strip("Address"n)) = 0 then
-         _paddr1_raw = "Practice Name"n;
-      else
-         _paddr1_raw = "Address"n;
+    from work.source as a
 
-      call prxsubstr(_unit_id, _paddr1_raw, _upos, _ulen);
-      if _upos > 0 then do;
-         "SAS Address 2"n = prxchange(_trim_id, -1, substr(_paddr1_raw, _upos, _ulen));
-         "SAS Address 1"n = prxchange(_trim_id, -1,
-            catx('', substr(_paddr1_raw, 1, _upos - 1), substr(_paddr1_raw, _upos + _ulen)));
-      end;
-      else do;
-         "SAS Address 1"n = _paddr1_raw;
-         "SAS Address 2"n = '';
-      end;
+    left join work.xwalk as b
 
-      drop _addr_id _num_id _unit_id _trim_id _upos _ulen _pname_norm _paddr1_raw;
-   run;
+        on strip(a.'Taxonomy Code (Primary Specialty)'n)
+         =
+           strip(b.'Taxonomy Code'n);
 
-   %reorder_after(
-      dsin=&dsout, dsout=&dsout,
-      anchor_var=%str(Address),
-      new_vars=%str("SAS Address 1"n "SAS Address 2"n)
-   );
-%mend add_practice_address_columns;
+quit;
 
 
-/* ---------------------------------------------------------------------------
-   Section 3: taxonomy crosswalk — looks up each provider row's taxonomy
-   code in the crosswalk table and brings over SpecialtyCode /
-   SpecialtyDescription / ProviderType.
-   --------------------------------------------------------------------------- */
-%macro add_taxonomy_crosswalk_columns(
-      dsin=, xwalk=, dsout=,
-      provider_taxonomy_col=%str(Taxonomy Code (Primary Specialty)),
-      xwalk_taxonomy_col=%str(Taxonomy Code));
+/*============================================================
+  STEP 6: Check the result
+============================================================*/
 
-   proc sql;
-      create table &dsout as
-      select a.*, b.SpecialtyCode, b.SpecialtyDescription, b.ProviderType
-      from &dsin as a
-      left join &xwalk as b
-         on a.%namelit(&provider_taxonomy_col) = b.%namelit(&xwalk_taxonomy_col)
-      ;
-   quit;
-%mend add_taxonomy_crosswalk_columns;
-
-
-/* ---------------------------------------------------------------------------
-   Section 4: final export — split into PRAC / FAC / removed and write the
-   two output workbooks.
-   --------------------------------------------------------------------------- */
-%macro export_prac_fac_and_removed(dsin=, output_file=, removed_file=, provider_type_col=ProviderType);
-   data _prac_ _fac_ _removed_;
-      set &dsin;
-      if &provider_type_col = 'P' then output _prac_;
-      else if &provider_type_col = 'F' then output _fac_;
-      else if missing(&provider_type_col) then output _removed_;
-   run;
-
-   libname _outbk_ xlsx "&output_file.";
-   data _outbk_.PRAC; set _prac_; run;
-   data _outbk_.FAC; set _fac_; run;
-   libname _outbk_ clear;
-
-   libname _rembk_ xlsx "&removed_file.";
-   data _rembk_.Sheet1; set _removed_; run;
-   libname _rembk_ clear;
-
-   proc datasets lib=work nolist;
-      delete _prac_ _fac_ _removed_;
-   quit;
-%mend export_prac_fac_and_removed;
-
-
-/* ---------------------------------------------------------------------------
-   Section 5: entry point.
-   --------------------------------------------------------------------------- */
-%macro main;
-   %if not %sysfunc(fileexist("&SOURCE_FILE.")) %then %do;
-      %put ERROR: Source file not found: &SOURCE_FILE.;
-      %put ERROR: Edit SOURCE_FILE in the USER SETTINGS section at the top of this program.;
-      %return;
-   %end;
-   %if not %sysfunc(fileexist("&XWALK_FILE.")) %then %do;
-      %put ERROR: Crosswalk file not found: &XWALK_FILE.;
-      %put ERROR: Edit XWALK_FILE in the USER SETTINGS section at the top of this program.;
-      %return;
-   %end;
-
-   %read_sheet_as_ds(path=&SOURCE_FILE., libref=_src_, sheet_name=&SOURCE_SHEET.,
-      header_row=&HEADER_ROW., dsout=work._source_raw_);
-   %clean_text_columns(dsin=work._source_raw_, dsout=work._source_clean_);
-   %add_practice_address_columns(dsin=work._source_clean_, dsout=work._source_addr_);
-
-   %read_sheet_as_ds(path=&XWALK_FILE., libref=_xwk_, sheet_name=&XWALK_SHEET.,
-      header_row=&XWALK_HEADER_ROW., dsout=work._xwalk_raw_);
-   %clean_text_columns(dsin=work._xwalk_raw_, dsout=work._xwalk_clean_);
-
-   %add_taxonomy_crosswalk_columns(dsin=work._source_addr_, xwalk=work._xwalk_clean_,
-      dsout=work._source_final_);
-
-   %export_prac_fac_and_removed(dsin=work._source_final_,
-      output_file=&OUTPUT_FILE., removed_file=&REMOVED_FILE.);
-
-   %put NOTE: Wrote &OUTPUT_FILE. (PRAC/FAC sheets);
-   %put NOTE: Wrote &REMOVED_FILE. (unmatched crosswalk rows);
-%mend main;
-
-%main;
+proc print data=work.provider_final(obs=20);
+run;
