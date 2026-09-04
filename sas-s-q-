@@ -1,67 +1,207 @@
 /*============================================================
-  STEP 1: Allow SAS to read Excel column names with spaces
-============================================================*/
-options validvarname=any;
-
-
-/*============================================================
-  STEP 2: Set file locations
+  CLEAN ADDRESS
+  Input / Output: work.provider_final
 ============================================================*/
 
-%let source_file = /your/path/source_file.xlsx;
-%let xwalk_file  = /your/path/xwalk_file.xlsx;
+data work.provider_final;
+
+    set work.provider_final;
+
+    length
+        'SAS Address 1'n $200
+        'SAS Address 2'n $100
+        _practice       $200
+        _address        $200
+        _real_address   $200;
+
+    /*--------------------------------------------------------
+      STEP 1: Clean values for comparison
+    --------------------------------------------------------*/
+
+    _practice = upcase(strip('Practice Name'n));
+    _address  = upcase(strip(Address));
 
 
-/*============================================================
-  STEP 3: Read SOURCE file
-============================================================*/
+    /*--------------------------------------------------------
+      STEP 2: Check if Practice Name actually contains
+              the street address
+    --------------------------------------------------------*/
 
-proc import datafile="&source_file."
-    out=work.source
-    dbms=xlsx
-    replace;
-    getnames=yes;
+    if _practice not in (
+        "20/20 INC",
+        "ASDA INC"
+    )
+
+    and prxmatch(
+        '/^\d+\s+(?:[A-Z0-9''.-]+\s+){0,6}
+        (ST|STREET|
+         AVE|AVENUE|
+         RD|ROAD|
+         DR|DRIVE|
+         BLVD|BOULEVARD|
+         LN|LANE|
+         CT|COURT|
+         HWY|HIGHWAY|
+         PKWY|PARKWAY|
+         WAY|
+         PL|PLACE|
+         CIR|CIRCLE|
+         TER|TERRACE|
+         TRL|TRAIL|
+         TPKE|TURNPIKE|
+         EXPY|EXPRESSWAY|
+         FWY|FREEWAY|
+         PLZ|PLAZA|
+         SQ|SQUARE|
+         LOOP|
+         PIKE|
+         ROW|
+         RUN|
+         PATH|
+         WALK|
+         XING|CROSSING|
+         BYP|BYPASS|
+         JCT|JUNCTION|
+         PT|POINT|
+         CV|COVE|
+         HL|HILL|
+         HTS|HEIGHTS|
+         CTR|CENTER|
+         EXT|EXTENSION)\b/ix',
+        _practice
+    )
+
+    and (
+        missing(_address)
+
+        or not prxmatch(
+            '/^\d+\s+(?:[A-Z0-9''.-]+\s+){0,6}
+            (ST|STREET|
+             AVE|AVENUE|
+             RD|ROAD|
+             DR|DRIVE|
+             BLVD|BOULEVARD|
+             LN|LANE|
+             CT|COURT|
+             HWY|HIGHWAY|
+             PKWY|PARKWAY|
+             WAY|
+             PL|PLACE|
+             CIR|CIRCLE|
+             TER|TERRACE|
+             TRL|TRAIL|
+             TPKE|TURNPIKE|
+             EXPY|EXPRESSWAY|
+             FWY|FREEWAY|
+             PLZ|PLAZA|
+             SQ|SQUARE|
+             LOOP|
+             PIKE|
+             ROW|
+             RUN|
+             PATH|
+             WALK|
+             XING|CROSSING|
+             BYP|BYPASS|
+             JCT|JUNCTION|
+             PT|POINT|
+             CV|COVE|
+             HL|HILL|
+             HTS|HEIGHTS|
+             CTR|CENTER|
+             EXT|EXTENSION)\b/ix',
+            _address
+        )
+    )
+
+    then _real_address = _practice;
+
+    /* Otherwise keep original Address */
+    else _real_address = _address;
+
+
+    /*--------------------------------------------------------
+      STEP 3: Create SAS Address 1 and SAS Address 2
+    --------------------------------------------------------*/
+
+    'SAS Address 1'n = strip(_real_address);
+    'SAS Address 2'n = "";
+
+
+    /*--------------------------------------------------------
+      STEP 4: Find suite / apartment / unit information
+    --------------------------------------------------------*/
+
+    _unit_position = prxmatch(
+        '/\b(
+         SUITE|STE|
+         APT|APARTMENT|
+         UNIT|
+         BLDG|BUILDING|
+         FL|FLOOR|
+         RM|ROOM|
+         DEPT|DEPARTMENT|
+         LOT|
+         TRLR|TRAILER|
+         SPC|SPACE|
+         OFC|OFFICE
+        )\s*#?\s*[A-Z0-9-]+
+        |#\s*[A-Z0-9-]+/ix',
+        'SAS Address 1'n
+    );
+
+
+    /*--------------------------------------------------------
+      STEP 5: Split Address 1 and Address 2
+
+      Example:
+      123 MAIN ST SUITE 200
+
+      SAS Address 1 = 123 MAIN ST
+      SAS Address 2 = SUITE 200
+    --------------------------------------------------------*/
+
+    if _unit_position > 0 then do;
+
+        'SAS Address 2'n =
+            strip(substr(
+                'SAS Address 1'n,
+                _unit_position
+            ));
+
+        'SAS Address 1'n =
+            strip(substr(
+                'SAS Address 1'n,
+                1,
+                _unit_position - 1
+            ));
+
+    end;
+
+
+    /*--------------------------------------------------------
+      STEP 6: Remove temporary variables
+    --------------------------------------------------------*/
+
+    drop
+        _practice
+        _address
+        _real_address
+        _unit_position;
+
 run;
 
 
 /*============================================================
-  STEP 4: Read XWALK file
-============================================================*/
-
-proc import datafile="&xwalk_file."
-    out=work.xwalk
-    dbms=xlsx
-    replace;
-    getnames=yes;
-run;
-
-
-/*============================================================
-  STEP 5: LEFT JOIN
-============================================================*/
-
-proc sql;
-
-    create table work.provider_final as
-
-    select
-        a.*,
-        b.Specialty
-
-    from work.source as a
-
-    left join work.xwalk as b
-
-        on strip(a.'Taxonomy Code (Primary Specialty)'n)
-         =
-           strip(b.'Taxonomy Code'n);
-
-quit;
-
-
-/*============================================================
-  STEP 6: Check the result
+  CHECK RESULTS
 ============================================================*/
 
 proc print data=work.provider_final(obs=20);
+
+    var
+        'Practice Name'n
+        Address
+        'SAS Address 1'n
+        'SAS Address 2'n;
+
 run;
