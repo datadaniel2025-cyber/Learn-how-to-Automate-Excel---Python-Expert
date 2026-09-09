@@ -1,0 +1,76 @@
+%macro clean_address(
+    input=,
+    output=,
+    addr1=,
+    addr2=
+);
+
+data &output;
+    set &input;
+
+    length SAS_Address        $250
+           SAS_Address_2      $250
+           Extract_Group_Name $250
+           _addr1             $250
+           _addr2             $250;
+
+    _addr1 = strip(&addr1);
+    _addr2 = strip(&addr2);
+
+    /* Find street address inside Address 1 */
+    street_pos = prxmatch(
+        '/\b\d+[A-Z]?\s+.*\b(ST|STREET|AVE|AVENUE|RD|ROAD|DR|DRIVE|
+        BLVD|BOULEVARD|LN|LANE|CT|COURT|HWY|HIGHWAY|PKWY|PARKWAY|
+        WAY|PL|PLACE|TER|TERRACE|TRL|TRAIL|CIR|CIRCLE)\b/i',
+        _addr1
+    );
+
+    /* Address 1 = group name + address */
+    if street_pos > 1 then do;
+
+        Extract_Group_Name =
+            strip(substr(_addr1,1,street_pos-1));
+
+        SAS_Address =
+            strip(substr(_addr1,street_pos));
+
+        SAS_Address_2 = _addr2;
+
+    end;
+
+    /* Address 1 = normal street address */
+    else if street_pos = 1 then do;
+
+        SAS_Address   = _addr1;
+        SAS_Address_2 = _addr2;
+
+    end;
+
+    /* Address 1 = group name
+       Address 2 = actual address */
+    else if prxmatch(
+        '/\b\d+[A-Z]?\s+.*\b(ST|STREET|AVE|AVENUE|RD|ROAD|DR|DRIVE|
+        BLVD|BOULEVARD|LN|LANE|CT|COURT|HWY|HIGHWAY|PKWY|PARKWAY|
+        WAY|PL|PLACE|TER|TERRACE|TRL|TRAIL|CIR|CIRCLE)\b/i',
+        _addr2
+    ) > 0 then do;
+
+        Extract_Group_Name = _addr1;
+        SAS_Address        = _addr2;
+        SAS_Address_2      = '';
+
+    end;
+
+    /* Cannot clearly identify an address */
+    else do;
+
+        Extract_Group_Name = _addr1;
+        SAS_Address_2      = _addr2;
+
+    end;
+
+    drop _addr1 _addr2 street_pos;
+
+run;
+
+%mend;
