@@ -24,130 +24,42 @@ data &output;
     /*====================================================
       STARTS WITH NUMBER?
     ====================================================*/
-    addr1_start_num =
-        prxmatch('/^\s*\d+/', _addr1) > 0;
-
-    addr2_start_num =
-        prxmatch('/^\s*\d+/', _addr2) > 0;
+    addr1_start_num = prxmatch('/^\s*\d+/', _addr1) > 0;
+    addr2_start_num = prxmatch('/^\s*\d+/', _addr2) > 0;
 
 
     /*====================================================
-      FIND NUMBERED STREET ADDRESS INSIDE ADDR1
-
-      Example:
-      ABC INC 123 MAIN ST
+      FIND NUMBERED STREET ADDRESS ANYWHERE
     ====================================================*/
     addr1_street_pos = prxmatch(
-        '/\b\d+[A-Z]?\s+.*\b(
-        ST|STREET|
-        AVE|AVENUE|
-        RD|ROAD|
-        DR|DRIVE|
-        BLVD|BOULEVARD|
-        LN|LANE|
-        CT|COURT|
-        CIR|CIRCLE|
-        HWY|HIGHWAY|
-        PKWY|PARKWAY|
-        WAY|
-        PL|PLACE|
-        TER|TERRACE|
-        TRL|TRAIL|
-        SQ|SQUARE|
-        PLZ|PLAZA
-        )\b/i',
+        '/\b\d+[A-Z]?\s+.*\b(ST|STREET|AVE|AVENUE|RD|ROAD|DR|DRIVE|BLVD|BOULEVARD|LN|LANE|CT|COURT|CIR|CIRCLE|HWY|HIGHWAY|PKWY|PARKWAY|WAY|PL|PLACE|TER|TERRACE|TRL|TRAIL|SQ|SQUARE|PLZ|PLAZA)\b/i',
         _addr1
     );
 
-
-    /*====================================================
-      FIND NUMBERED STREET ADDRESS INSIDE ADDR2
-    ====================================================*/
     addr2_street_pos = prxmatch(
-        '/\b\d+[A-Z]?\s+.*\b(
-        ST|STREET|
-        AVE|AVENUE|
-        RD|ROAD|
-        DR|DRIVE|
-        BLVD|BOULEVARD|
-        LN|LANE|
-        CT|COURT|
-        CIR|CIRCLE|
-        HWY|HIGHWAY|
-        PKWY|PARKWAY|
-        WAY|
-        PL|PLACE|
-        TER|TERRACE|
-        TRL|TRAIL|
-        SQ|SQUARE|
-        PLZ|PLAZA
-        )\b/i',
+        '/\b\d+[A-Z]?\s+.*\b(ST|STREET|AVE|AVENUE|RD|ROAD|DR|DRIVE|BLVD|BOULEVARD|LN|LANE|CT|COURT|CIR|CIRCLE|HWY|HIGHWAY|PKWY|PARKWAY|WAY|PL|PLACE|TER|TERRACE|TRL|TRAIL|SQ|SQUARE|PLZ|PLAZA)\b/i',
         _addr2
     );
 
 
     /*====================================================
-      STREET KEYWORD IN ADDR1
+      STREET KEYWORD CHECK
     ====================================================*/
     addr1_has_street_word = prxmatch(
-        '/\b(
-        ST|STREET|
-        AVE|AVENUE|
-        RD|ROAD|
-        DR|DRIVE|
-        BLVD|BOULEVARD|
-        LN|LANE|
-        CT|COURT|
-        CIR|CIRCLE|
-        HWY|HIGHWAY|
-        PKWY|PARKWAY|
-        WAY|
-        PL|PLACE|
-        TER|TERRACE|
-        TRL|TRAIL|
-        SQ|SQUARE|
-        PLZ|PLAZA
-        )\b/i',
+        '/\b(ST|STREET|AVE|AVENUE|RD|ROAD|DR|DRIVE|BLVD|BOULEVARD|LN|LANE|CT|COURT|CIR|CIRCLE|HWY|HIGHWAY|PKWY|PARKWAY|WAY|PL|PLACE|TER|TERRACE|TRL|TRAIL|SQ|SQUARE|PLZ|PLAZA)\b/i',
         _addr1
     ) > 0;
 
-
-    /*====================================================
-      STREET KEYWORD IN ADDR2
-
-      Examples:
-      TAYLOR AT MAIN ST
-      NORTH BROAD STREET
-      WEST PARKWAY
-    ====================================================*/
     addr2_has_street_word = prxmatch(
-        '/\b(
-        ST|STREET|
-        AVE|AVENUE|
-        RD|ROAD|
-        DR|DRIVE|
-        BLVD|BOULEVARD|
-        LN|LANE|
-        CT|COURT|
-        CIR|CIRCLE|
-        HWY|HIGHWAY|
-        PKWY|PARKWAY|
-        WAY|
-        PL|PLACE|
-        TER|TERRACE|
-        TRL|TRAIL|
-        SQ|SQUARE|
-        PLZ|PLAZA
-        )\b/i',
+        '/\b(ST|STREET|AVE|AVENUE|RD|ROAD|DR|DRIVE|BLVD|BOULEVARD|LN|LANE|CT|COURT|CIR|CIRCLE|HWY|HIGHWAY|PKWY|PARKWAY|WAY|PL|PLACE|TER|TERRACE|TRL|TRAIL|SQ|SQUARE|PLZ|PLAZA)\b/i',
         _addr2
     ) > 0;
 
 
     /*====================================================
       CASE 1
-      ADDR1 = group name + numbered street address
+      ADDR1 = GROUP NAME + STREET ADDRESS
 
-      Example:
       ABC INC 123 MAIN ST
     ====================================================*/
     if addr1_street_pos > 1 then do;
@@ -164,19 +76,15 @@ data &output;
 
 
     /*====================================================
-      CASE 2 - YOUR NEW RULE
+      CASE 2
+      ADDR1 DOES NOT START WITH NUMBER
+      ADDR2 CONTAINS STREET KEYWORD
 
-      ADDR1 does NOT start with number
-      AND
-      ADDR2 contains street keyword
+      CHESTER MUSIC INC
+      YALOR INC DR
 
-      Example:
-      ADDR1 = MEDICAL CENTER
-      ADDR2 = TAYLOR AT MAIN ST
-
-      Result:
-      Group       = MEDICAL CENTER
-      SAS Address = TAYLOR AT MAIN ST
+      MEDICAL CENTER
+      TAYLOR AT MAIN ST
     ====================================================*/
     else if addr1_start_num = 0
         and not missing(_addr2)
@@ -191,10 +99,9 @@ data &output;
 
     /*====================================================
       CASE 3
-      ADDR1 = group name
-      ADDR2 = numbered address
+      ADDR1 = GROUP NAME
+      ADDR2 STARTS WITH NUMBER
 
-      Example:
       ABC MEDICAL
       123 MAIN ST
     ====================================================*/
@@ -211,9 +118,8 @@ data &output;
 
     /*====================================================
       CASE 4
-      ADDR1 is normal numbered address
+      ADDR1 IS NORMAL NUMBERED ADDRESS
 
-      Example:
       123 MAIN ST
       SUITE 200
     ====================================================*/
@@ -227,8 +133,8 @@ data &output;
 
     /*====================================================
       CASE 5
-      ADDR1 blank
-      ADDR2 = numbered address
+      ADDR1 BLANK
+      ADDR2 STARTS WITH NUMBER
     ====================================================*/
     else if missing(_addr1)
         and addr2_start_num = 1 then do;
@@ -241,8 +147,8 @@ data &output;
 
     /*====================================================
       CASE 6
-      ADDR1 blank
-      ADDR2 contains street keyword
+      ADDR1 BLANK
+      ADDR2 HAS STREET KEYWORD
     ====================================================*/
     else if missing(_addr1)
         and addr2_has_street_word = 1 then do;
@@ -255,10 +161,9 @@ data &output;
 
     /*====================================================
       CASE 7
-      ADDR1 itself does not start with number
-      but contains street keyword
+      ADDR1 DOES NOT START WITH NUMBER
+      BUT ADDR1 ITSELF HAS STREET KEYWORD
 
-      Example:
       NORTH MAIN ST
     ====================================================*/
     else if addr1_has_street_word = 1 then do;
@@ -271,8 +176,7 @@ data &output;
 
     /*====================================================
       CASE 8
-      Cannot identify a real address
-      Preserve the values
+      NOTHING CLEARLY LOOKS LIKE ADDRESS
     ====================================================*/
     else do;
 
@@ -284,7 +188,7 @@ data &output;
 
 
     /*====================================================
-      REMOVE TEMP VARIABLES
+      DROP TEMP VARIABLES
     ====================================================*/
     drop _addr1
          _addr2
