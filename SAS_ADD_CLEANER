@@ -6,346 +6,323 @@
 );
 
 data &output;
+
+    /* Final output columns */
+    length SAS_Address_1
+           SAS_Address_2
+           Extra_Group_Name $500;
+
+    /* Temporary columns */
+    length _a1
+           _a2
+           _candidate_group
+           _candidate_address $500;
+
     set &input;
 
-    length SAS_Address        $250
-           SAS_Address_2      $250
-           Extract_Group_Name $250
-           _addr1             $250
-           _addr2             $250;
+    /* Standardize spaces */
+    _a1 = compbl(strip(&addr1));
+    _a2 = compbl(strip(&addr2));
 
-    /*====================================================
-      COPY ORIGINAL ADDRESS VALUES
-    ====================================================*/
-    _addr1 = strip(&addr1);
-    _addr2 = strip(&addr2);
-
-
-    /*====================================================
-      BASIC CHECKS
-    ====================================================*/
-
-    /* Does address start with a number? */
-    addr1_start_num =
-        prxmatch('/^\s*\d+/', _addr1) > 0;
-
-    addr2_start_num =
-        prxmatch('/^\s*\d+/', _addr2) > 0;
-
-
-    /*====================================================
-      FIND NUMBERED STREET ADDRESS INSIDE ADDR1
-
-      Examples:
-      ABC MEDICAL 123 MAIN ST
-      ABC INC 250 MARKET AVE
-    ====================================================*/
-    addr1_street_pos = prxmatch(
-        '/\b\d+[A-Z]?\s+.*\b(
-        ST|STREET|
-        AVE|AVENUE|
-        RD|ROAD|
-        DR|DRIVE|
-        BLVD|BOULEVARD|
-        LN|LANE|
-        CT|COURT|
-        CIR|CIRCLE|
-        HWY|HIGHWAY|
-        PKWY|PARKWAY|
-        WAY|
-        PL|PLACE|
-        TER|TERRACE|
-        TRL|TRAIL|
-        SQ|SQUARE|
-        PLZ|PLAZA
-        )\b/i',
-        _addr1
+    call missing(
+        SAS_Address_1,
+        SAS_Address_2,
+        Extra_Group_Name
     );
 
 
-    /*====================================================
-      FIND NUMBERED STREET ADDRESS INSIDE ADDR2
-    ====================================================*/
-    addr2_street_pos = prxmatch(
-        '/\b\d+[A-Z]?\s+.*\b(
-        ST|STREET|
-        AVE|AVENUE|
-        RD|ROAD|
-        DR|DRIVE|
-        BLVD|BOULEVARD|
-        LN|LANE|
-        CT|COURT|
-        CIR|CIRCLE|
-        HWY|HIGHWAY|
-        PKWY|PARKWAY|
-        WAY|
-        PL|PLACE|
-        TER|TERRACE|
-        TRL|TRAIL|
-        SQ|SQUARE|
-        PLZ|PLAZA
-        )\b/i',
-        _addr2
-    );
+    /*==========================================================*
+     * 1. Check whether each value starts with a street number
+     *==========================================================*/
+
+    _a1_starts_number =
+        prxmatch(
+            '/^\s*\d+[A-Z0-9\-\/]*\s+/i',
+            _a1
+        ) > 0;
+
+    _a2_starts_number =
+        prxmatch(
+            '/^\s*\d+[A-Z0-9\-\/]*\s+/i',
+            _a2
+        ) > 0;
 
 
-    /*====================================================
-      STREET WORD CHECK
+    /*==========================================================*
+     * 2. Check for street keywords anywhere in the value
+     *
+     * Examples:
 
-      This handles addresses that DO NOT start with number.
+     *==========================================================*/
 
-      Example:
-      TAYLOR AT MAIN ST
-      NORTH BROAD STREET
-      MAIN STREET
-      PARKWAY WEST
-    ====================================================*/
+    _a1_has_street_keyword =
+        prxmatch(
+            '/\b(ST|STREET|AVE|AVENUE|RD|ROAD|DR|DRIVE|BLVD|BOULEVARD|LN|LANE|CT|COURT|HWY|HIGHWAY|PKWY|PARKWAY|WAY|PL|PLACE|TRL|TRAIL|TER|TERRACE|CIR|CIRCLE|SQ|SQUARE|EXPY|EXPRESSWAY|TPKE|TURNPIKE|PIKE|ROUTE|RTE)\b\.?/i',
+            _a1
+        ) > 0;
 
-    addr1_has_street_word = prxmatch(
-        '/\b(
-        ST|STREET|
-        AVE|AVENUE|
-        RD|ROAD|
-        DR|DRIVE|
-        BLVD|BOULEVARD|
-        LN|LANE|
-        CT|COURT|
-        CIR|CIRCLE|
-        HWY|HIGHWAY|
-        PKWY|PARKWAY|
-        WAY|
-        PL|PLACE|
-        TER|TERRACE|
-        TRL|TRAIL|
-        SQ|SQUARE|
-        PLZ|PLAZA
-        )\b/i',
-        _addr1
-    ) > 0;
+    _a2_has_street_keyword =
+        prxmatch(
+            '/\b(ST|STREET|AVE|AVENUE|RD|ROAD|DR|DRIVE|BLVD|BOULEVARD|LN|LANE|CT|COURT|HWY|HIGHWAY|PKWY|PARKWAY|WAY|PL|PLACE|TRL|TRAIL|TER|TERRACE|CIR|CIRCLE|SQ|SQUARE|EXPY|EXPRESSWAY|TPKE|TURNPIKE|PIKE|ROUTE|RTE)\b\.?/i',
+            _a2
+        ) > 0;
 
 
-    addr2_has_street_word = prxmatch(
-        '/\b(
-        ST|STREET|
-        AVE|AVENUE|
-        RD|ROAD|
-        DR|DRIVE|
-        BLVD|BOULEVARD|
-        LN|LANE|
-        CT|COURT|
-        CIR|CIRCLE|
-        HWY|HIGHWAY|
-        PKWY|PARKWAY|
-        WAY|
-        PL|PLACE|
-        TER|TERRACE|
-        TRL|TRAIL|
-        SQ|SQUARE|
-        PLZ|PLAZA
-        )\b/i',
-        _addr2
-    ) > 0;
+    /*==========================================================*
+     * 3. Check for PO Box addresses
+     *==========================================================*/
+
+    _a1_po_box =
+        prxmatch(
+            '/\bP\.?\s*O\.?\s+BOX\s+\d+/i',
+            _a1
+        ) > 0;
+
+    _a2_po_box =
+        prxmatch(
+            '/\bP\.?\s*O\.?\s+BOX\s+\d+/i',
+            _a2
+        ) > 0;
 
 
-    /*====================================================
-      CHECK SUITE / UNIT INFORMATION
-    ====================================================*/
+    /*==========================================================*
+     * 4. Final address indicators
+     *==========================================================*/
 
-    addr2_is_unit = prxmatch(
-        '/\b(
-        SUITE|STE|
-        APT|APARTMENT|
-        UNIT|
-        BLDG|BUILDING|
-        FLOOR|FL|
-        ROOM|RM
-        )\b|#/i',
-        _addr2
-    ) > 0;
+    _a1_is_address =
+        _a1_starts_number
+        or _a1_has_street_keyword
+        or _a1_po_box;
+
+    _a2_is_address =
+        _a2_starts_number
+        or _a2_has_street_keyword
+        or _a2_po_box;
 
 
-    /*====================================================
-      CASE 1
+    /*==========================================================*
+     * 5. Check whether Address 2 is only a unit or suite
+     *==========================================================*/
 
-      ADDR1 contains:
-      GROUP NAME + STREET ADDRESS
+    _a2_is_unit =
+        prxmatch(
+            '/^\s*(SUITE|STE|APT|APARTMENT|UNIT|BUILDING|BLDG|FLOOR|FL|ROOM|RM|#)\b/i',
+            _a2
+        ) > 0;
 
-      Example:
-      ABC MEDICAL CENTER 123 MAIN ST
 
-      OUTPUT:
-      Group = ABC MEDICAL CENTER
-      SAS Address = 123 MAIN ST
-    ====================================================*/
+    /*==========================================================*
+     * 6. Check for group/business names
+     *==========================================================*/
 
-    if addr1_street_pos > 1 then do;
+    _a1_is_group =
+        prxmatch(
+            '/\b(INC|LLC|LLP|LTD|CORP|CORPORATION|COMPANY|CO|CENTER|CENTRE|CLINIC|GROUP|HOSPITAL|HEALTH|MEDICAL|ASSOCIATES|ASSOC|PRACTICE|PC|PLLC)\b/i',
+            _a1
+        ) > 0;
 
-        Extract_Group_Name =
-            strip(substr(_addr1,1,addr1_street_pos-1));
+    _a2_is_group =
+        prxmatch(
+            '/\b(INC|LLC|LLP|LTD|CORP|CORPORATION|COMPANY|CO|CENTER|CENTRE|CLINIC|GROUP|HOSPITAL|HEALTH|MEDICAL|ASSOCIATES|ASSOC|PRACTICE|PC|PLLC)\b/i',
+            _a2
+        ) > 0;
 
-        SAS_Address =
-            strip(substr(_addr1,addr1_street_pos));
 
-        SAS_Address_2 = _addr2;
+    /*==========================================================*
+     * 7. Find a group name and numeric address combined in
+     *    Address 1
+     *
+     * Example:
+     * ABC Medical Inc 123 Main St
+     *==========================================================*/
+
+    _split_position =
+        prxmatch(
+            '/\b\d+[A-Z0-9\-]*\s+.*\b(ST|STREET|AVE|AVENUE|RD|ROAD|DR|DRIVE|BLVD|BOULEVARD|LN|LANE|CT|COURT|HWY|HIGHWAY|PKWY|PARKWAY|WAY|PL|PLACE|TRL|TRAIL|TER|TERRACE|CIR|CIRCLE|ROUTE|RTE)\b/i',
+            _a1
+        );
+
+    if _split_position > 1 then do;
+
+        _candidate_group =
+            strip(substr(_a1, 1, _split_position - 1));
+
+        _candidate_address =
+            strip(substr(_a1, _split_position));
+
+        /* Split only if the first part looks like a group name */
+        if prxmatch(
+            '/\b(INC|LLC|LLP|LTD|CORP|CORPORATION|COMPANY|CO|CENTER|CENTRE|CLINIC|GROUP|HOSPITAL|HEALTH|MEDICAL|ASSOCIATES|ASSOC|PRACTICE|PC|PLLC)\b/i',
+            _candidate_group
+        ) > 0
+        then do;
+
+            Extra_Group_Name = _candidate_group;
+            SAS_Address_1    = _candidate_address;
+            SAS_Address_2    = _a2;
+
+        end;
+    end;
+
+
+    /*==========================================================*
+     * 8. Process remaining scenarios
+     *==========================================================*/
+
+    if missing(SAS_Address_1) then do;
+
+
+        /*------------------------------------------------------*
+         * Address 1 is blank and Address 2 is an address
+         *------------------------------------------------------*/
+
+        if missing(_a1) and _a2_is_address then do;
+
+            SAS_Address_1 = _a2;
+            call missing(SAS_Address_2);
+
+        end;
+
+
+        /*------------------------------------------------------*
+         * Address 1 is a group name or other non-address value,
+         * while Address 2 contains an address.
+         *
+         * Radiation Ming Inc | One Medical Dr
+         * Medical Center     | Taylor at Main St
+         * ABC Clinic         | 123 Main St
+         *------------------------------------------------------*/
+
+        else if not missing(_a1)
+             and not _a1_is_address
+             and _a2_is_address
+        then do;
+
+            Extra_Group_Name = _a1;
+            SAS_Address_1    = _a2;
+            call missing(SAS_Address_2);
+
+        end;
+
+
+        /*------------------------------------------------------*
+         * Address 1 is already a valid address
+         *------------------------------------------------------*/
+
+        else if _a1_is_address then do;
+
+            SAS_Address_1 = _a1;
+
+            if not missing(_a2) then
+                SAS_Address_2 = _a2;
+
+        end;
+
+
+        /*------------------------------------------------------*
+         * Address 1 contains only a group/business name
+         *------------------------------------------------------*/
+
+        else if _a1_is_group then do;
+
+            Extra_Group_Name = _a1;
+
+            if _a2_is_address then
+                SAS_Address_1 = _a2;
+            else
+                SAS_Address_2 = _a2;
+
+        end;
+
+
+        /*------------------------------------------------------*
+         * Address 1 is blank but Address 2 contains data
+         *------------------------------------------------------*/
+
+        else if missing(_a1) and not missing(_a2) then do;
+
+            if _a2_is_group and not _a2_is_address then
+                Extra_Group_Name = _a2;
+            else
+                SAS_Address_1 = _a2;
+
+        end;
+
+
+        /*------------------------------------------------------*
+         * Fallback: preserve the original values
+         *------------------------------------------------------*/
+
+        else do;
+
+            SAS_Address_1 = _a1;
+            SAS_Address_2 = _a2;
+
+        end;
 
     end;
 
 
-    /*====================================================
-      CASE 2
+    /*==========================================================*
+     * 9. Final safeguard
+     *
+     * If SAS Address 1 is blank but SAS Address 2 contains
+     * a street keyword, move Address 2 into Address 1.
+     *==========================================================*/
 
-      ADDR1 = normal numbered address
+    if missing(SAS_Address_1)
+       and not missing(SAS_Address_2)
+       and (
+            prxmatch(
+                '/^\s*\d+[A-Z0-9\-\/]*\s+/i',
+                SAS_Address_2
+            ) > 0
 
-      Example:
-      123 MAIN ST
-      SUITE 200
-    ====================================================*/
+            or
 
-    else if addr1_start_num = 1 then do;
+            prxmatch(
+                '/\b(ST|STREET|AVE|AVENUE|RD|ROAD|DR|DRIVE|BLVD|BOULEVARD|LN|LANE|CT|COURT|HWY|HIGHWAY|PKWY|PARKWAY|WAY|PL|PLACE|TRL|TRAIL|TER|TERRACE|CIR|CIRCLE|SQ|SQUARE|EXPY|EXPRESSWAY|TPKE|TURNPIKE|PIKE|ROUTE|RTE)\b\.?/i',
+                SAS_Address_2
+            ) > 0
+       )
+    then do;
 
-        SAS_Address   = _addr1;
-        SAS_Address_2 = _addr2;
-
-    end;
-
-
-    /*====================================================
-      CASE 3
-
-      ADDR1 = group name
-      ADDR2 = numbered address
-
-      Example:
-      ABC MEDICAL CENTER
-      123 MAIN ST
-    ====================================================*/
-
-    else if not missing(_addr1)
-        and addr1_start_num = 0
-        and addr2_start_num = 1 then do;
-
-        Extract_Group_Name = _addr1;
-        SAS_Address        = _addr2;
-        SAS_Address_2      = '';
+        SAS_Address_1 = SAS_Address_2;
+        call missing(SAS_Address_2);
 
     end;
 
 
-    /*====================================================
-      CASE 4
+    /* Clean final spaces */
+    SAS_Address_1 =
+        compbl(strip(SAS_Address_1));
 
-      ADDR1 blank
-      ADDR2 = numbered address
-    ====================================================*/
+    SAS_Address_2 =
+        compbl(strip(SAS_Address_2));
 
-    else if missing(_addr1)
-        and addr2_start_num = 1 then do;
-
-        SAS_Address   = _addr2;
-        SAS_Address_2 = '';
-
-    end;
+    Extra_Group_Name =
+        compbl(strip(Extra_Group_Name));
 
 
-    /*====================================================
-      CASE 5
-
-      ADDR1 = group name
-      ADDR2 contains numbered street address
-      somewhere inside the value
-    ====================================================*/
-
-    else if not missing(_addr1)
-        and addr2_street_pos > 0 then do;
-
-        Extract_Group_Name = _addr1;
-        SAS_Address        = _addr2;
-        SAS_Address_2      = '';
-
-    end;
-
-
-    /*====================================================
-      CASE 6
-
-      NEW IMPORTANT CASE
-
-      Neither one starts with a number,
-      but ADDR2 contains street keyword.
-
-      Example:
-
-      ADDR1 = MEDICAL CENTER
-      ADDR2 = TAYLOR AT MAIN ST
-
-      OUTPUT:
-      Group = MEDICAL CENTER
-      SAS Address = TAYLOR AT MAIN ST
-    ====================================================*/
-
-    else if not missing(_addr1)
-        and addr1_start_num = 0
-        and addr2_start_num = 0
-        and addr2_has_street_word = 1 then do;
-
-        Extract_Group_Name = _addr1;
-        SAS_Address        = _addr2;
-        SAS_Address_2      = '';
-
-    end;
-
-
-    /*====================================================
-      CASE 7
-
-      ADDR1 itself does not start with number,
-      but contains street keyword.
-
-      Example:
-      NORTH MAIN ST
-
-      Treat ADDR1 as address.
-    ====================================================*/
-
-    else if addr1_has_street_word = 1 then do;
-
-        SAS_Address   = _addr1;
-        SAS_Address_2 = _addr2;
-
-    end;
-
-
-    /*====================================================
-      CASE 8
-
-      Cannot confidently identify an address.
-
-      Preserve the data instead of deleting it.
-    ====================================================*/
-
-    else do;
-
-        Extract_Group_Name = _addr1;
-        SAS_Address        = '';
-        SAS_Address_2      = _addr2;
-
-    end;
-
-
-    /*====================================================
-      REMOVE TEMPORARY VARIABLES
-    ====================================================*/
-
-    drop _addr1
-         _addr2
-         addr1_start_num
-         addr2_start_num
-         addr1_street_pos
-         addr2_street_pos
-         addr1_has_street_word
-         addr2_has_street_word
-         addr2_is_unit;
+    /* Remove temporary columns */
+    drop
+        _a1
+        _a2
+        _candidate_group
+        _candidate_address
+        _a1_starts_number
+        _a2_starts_number
+        _a1_has_street_keyword
+        _a2_has_street_keyword
+        _a1_po_box
+        _a2_po_box
+        _a1_is_address
+        _a2_is_address
+        _a2_is_unit
+        _a1_is_group
+        _a2_is_group
+        _split_position;
 
 run;
 
-%mend;
+%mend clean_address;
