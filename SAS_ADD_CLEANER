@@ -17,43 +17,44 @@ data &output;
     _addr1 = strip(&addr1);
     _addr2 = strip(&addr2);
 
-    /* Find street address inside Address 1 */
-    street_pos = prxmatch(
+    /*--------------------------------------------------
+      Basic checks
+    --------------------------------------------------*/
+
+    /* Does value start with a number? */
+    addr1_start_num = prxmatch('/^\s*\d+/', _addr1) > 0;
+    addr2_start_num = prxmatch('/^\s*\d+/', _addr2) > 0;
+
+    /* Find a street address anywhere inside the field */
+    addr1_street_pos = prxmatch(
         '/\b\d+[A-Z]?\s+.*\b(ST|STREET|AVE|AVENUE|RD|ROAD|DR|DRIVE|
-        BLVD|BOULEVARD|LN|LANE|CT|COURT|HWY|HIGHWAY|PKWY|PARKWAY|
-        WAY|PL|PLACE|TER|TERRACE|TRL|TRAIL|CIR|CIRCLE)\b/i',
+        BLVD|BOULEVARD|LN|LANE|CT|COURT|CIR|CIRCLE|
+        HWY|HIGHWAY|PKWY|PARKWAY|WAY|PL|PLACE|
+        TER|TERRACE|TRL|TRAIL|SQ|SQUARE|PLZ|PLAZA)\b/i',
         _addr1
     );
 
-    /* Address 1 = group name + address */
-    if street_pos > 1 then do;
-
-        Extract_Group_Name =
-            strip(substr(_addr1,1,street_pos-1));
-
-        SAS_Address =
-            strip(substr(_addr1,street_pos));
-
-        SAS_Address_2 = _addr2;
-
-    end;
-
-    /* Address 1 = normal street address */
-    else if street_pos = 1 then do;
-
-        SAS_Address   = _addr1;
-        SAS_Address_2 = _addr2;
-
-    end;
-
-    /* Address 1 = group name
-       Address 2 = actual address */
-    else if prxmatch(
+    addr2_street_pos = prxmatch(
         '/\b\d+[A-Z]?\s+.*\b(ST|STREET|AVE|AVENUE|RD|ROAD|DR|DRIVE|
-        BLVD|BOULEVARD|LN|LANE|CT|COURT|HWY|HIGHWAY|PKWY|PARKWAY|
-        WAY|PL|PLACE|TER|TERRACE|TRL|TRAIL|CIR|CIRCLE)\b/i',
+        BLVD|BOULEVARD|LN|LANE|CT|COURT|CIR|CIRCLE|
+        HWY|HIGHWAY|PKWY|PARKWAY|WAY|PL|PLACE|
+        TER|TERRACE|TRL|TRAIL|SQ|SQUARE|PLZ|PLAZA)\b/i',
         _addr2
-    ) > 0 then do;
+    );
+
+
+    /*==================================================
+      CASE 1
+      Addr1 = group name
+      Addr2 = actual address
+
+      Example:
+      ABC MEDICAL GROUP
+      1234 MAIN ST
+    ==================================================*/
+    if addr1_start_num = 0
+       and not missing(_addr1)
+       and addr2_start_num = 1 then do;
 
         Extract_Group_Name = _addr1;
         SAS_Address        = _addr2;
@@ -61,15 +62,94 @@ data &output;
 
     end;
 
-    /* Cannot clearly identify an address */
+
+    /*==================================================
+      CASE 2
+      Addr1 contains group name + address together
+
+      Example:
+      ABC INC 123 MAIN ST
+    ==================================================*/
+    else if addr1_street_pos > 1 then do;
+
+        Extract_Group_Name =
+            strip(substr(_addr1,1,addr1_street_pos-1));
+
+        SAS_Address =
+            strip(substr(_addr1,addr1_street_pos));
+
+        SAS_Address_2 = _addr2;
+
+    end;
+
+
+    /*==================================================
+      CASE 3
+      Addr1 is normal street address
+
+      Example:
+      123 MAIN ST
+      SUITE 200
+    ==================================================*/
+    else if addr1_start_num = 1 then do;
+
+        SAS_Address   = _addr1;
+        SAS_Address_2 = _addr2;
+
+    end;
+
+
+    /*==================================================
+      CASE 4
+      Addr1 blank
+      Addr2 is actual address
+    ==================================================*/
+    else if missing(_addr1)
+        and addr2_start_num = 1 then do;
+
+        SAS_Address   = _addr2;
+        SAS_Address_2 = '';
+
+    end;
+
+
+    /*==================================================
+      CASE 5
+      Addr1 looks like group name
+      Addr2 contains address but does not necessarily
+      start exactly with number
+    ==================================================*/
+    else if not missing(_addr1)
+        and addr2_street_pos > 0 then do;
+
+        Extract_Group_Name = _addr1;
+        SAS_Address        = _addr2;
+        SAS_Address_2      = '';
+
+    end;
+
+
+    /*==================================================
+      CASE 6
+      Neither field clearly looks like street address
+
+      Preserve data
+    ==================================================*/
     else do;
 
         Extract_Group_Name = _addr1;
+        SAS_Address        = '';
         SAS_Address_2      = _addr2;
 
     end;
 
-    drop _addr1 _addr2 street_pos;
+
+    drop _addr1
+         _addr2
+         addr1_start_num
+         addr2_start_num
+         addr1_street_pos
+         addr2_street_pos;
 
 run;
 
