@@ -194,9 +194,37 @@ def local_align(scan, tpl, tile=360, search=14):
 def ink_mask(scan, tpl):
     """True where the scan has ink the blank template does not (handwriting, typing, ticks)."""
     tpl_dark = ndimage.grey_erosion(tpl, size=(7, 7))     # tolerate ~1px misalignment of printed lines
-    mask = (tpl_dark - scan) > INK_DIFF
-    mask |= (scan < 110) & (tpl_dark > 200)                   # clearly dark ink over white template paper
+    # The template's light tint inside boxes/fields often scans as mid-gray or a copier dot
+    # pattern. Measure what that tint became on THIS scan (per area of the page) and treat it as
+    # blank paper; there, compare a smoothed scan so halftone dots blend into a flat gray.
+    tint = (tpl_dark > 215) & (tpl_dark < 250)
+    ref, eff = tpl_dark.astype(np.float32), scan.astype(np.float32)
+    if tint.any():
+        smooth = ndimage.gaussian_filter(eff, 2.0)
+        level = _tint_level(smooth, tint)
+        ref = np.where(tint, np.minimum(level, tpl_dark), ref)
+        # Ink must be dark both raw and smoothed: halftone dots vanish when smoothed,
+        # and blur from a thick printed border is not dark in the raw scan.
+        eff = np.where(tint, np.maximum(smooth, eff), eff)
+    margin = np.where(tint, np.minimum(INK_DIFF, 0.45 * ref), INK_DIFF)  # darker tint -> smaller margin
+    mask = (ref - eff) > margin
+    mask |= (eff < 110) & (ref > 200)                         # clearly dark ink over white paper
     return ndimage.binary_opening(mask, structure=np.ones((2, 2)))
+
+
+def _tint_level(smooth, tint, tile=300):
+    """Per-pixel brightness of the template tint as it came out on the scan (median per tile)."""
+    h, w = smooth.shape
+    ny, nx = (h + tile - 1) // tile, (w + tile - 1) // tile
+    overall = float(np.median(smooth[tint]))
+    grid = np.full((ny, nx), overall, np.float32)
+    for iy in range(ny):
+        for ix in range(nx):
+            sl = (slice(iy * tile, (iy + 1) * tile), slice(ix * tile, (ix + 1) * tile))
+            vals = smooth[sl][tint[sl]]
+            if vals.size > 500:
+                grid[iy, ix] = np.median(vals)
+    return np.kron(grid, np.ones((tile, tile), np.float32))[:h, :w]
 
 
 # ================================================================ OCR
@@ -473,6 +501,358 @@ def pick_page(doc, tpl_img):
     return best[1]
 
 
+# ================================================================ other form layouts
+# A scan whose layout is not the template's (another plan's county/services form, etc.) is read
+# by its printed labels instead of by position: OCR the whole page, take the text after labels
+# like "Agency Name:" / "NPI:", and pair every checkbox with the county/service name beside it.
+LAYOUT_MATCH_MIN = 0.6    # template match below this => different form, read it by labels
+DYN_DPI = 300
+CHECK_CONTRAST_ON = 0.36  # box middle this much darker than the paper beside it (1 = as dark as the outline) ...
+CHECK_DARK_ON = 0.28      # ... and this share of it truly ink-dark => checked (tick or filled square)
+
+# label printed on the scan -> what it is
+SCAN_LABELS = {
+    "entity": ["agency name", "provider agency name", "entity name", "provider name", "organization name",
+               "legal name", "business name", "group name"],
+    "npi": ["npi", "npi number", "group npi", "billing npi", "type 2 npi"],
+    "tin": ["tin", "tax id", "ein", "federal tax id", "tax id number"],
+    "contact_name": ["contact name", "contact person"],
+    "contact_email": ["contact email", "contact e mail"],
+    "email": ["email", "e mail", "email address"],
+    "contact_phone": ["contact phone", "contact phone number"],
+    "phone": ["phone", "telephone", "phone number"],
+    "fax": ["fax", "fax number"],
+    "address": ["address", "service address", "street address"],
+    "caqh": ["caqh id", "caqh"],
+}
+# what it is -> template text field, found by these words in the field's name / tooltip
+# (so a template with fields like "Entity Name" or "NPI" is picked up automatically)
+TEMPLATE_KEYS = {
+    "entity": [r"\bentity\b", r"\bagency name\b", r"\bprovider name\b", r"\borganization\b"],
+    "npi": [r"\bnpi\b"],
+    "tin": [r"\btin\b", r"\btax\b", r"\bein\b"],
+    "email": [r"\be ?mail\b"],
+    "phone": [r"\bphone\b", r"\btelephone\b"],
+    "fax": [r"\bfax\b"],
+    "address": [r"\baddress\b"],
+    "caqh": [r"\bcaqh\b"],
+    "contact_name": [r"\bcontact name\b"],
+}
+STRICT_KINDS = {"npi", "tin", "phone", "contact_phone", "fax", "email", "contact_email"}  # re-read enlarged
+LETTER_FIX = str.maketrans({"0": "o", "1": "i", "5": "s", "8": "b", "9": "g", "|": "l"})
+
+
+def _words(t):
+    return re.sub(r"[^a-z0-9]+", " ", t.lower().replace("_", " ")).strip()
+
+
+def _ratio(a, b):
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def _field_text(w):
+    return _words(f"{w.field_name} {w.field_label or ''}")
+
+
+def template_field(text_widgets, kind):
+    for w in text_widgets:
+        if any(re.search(p, _field_text(w)) for p in TEMPLATE_KEYS.get(kind, [])):
+            return w.field_name
+    return None
+
+
+def checkbox_names(w):
+    """Ways a template checkbox may be printed on a scan ('Adams County' -> 'adams county', 'adams')."""
+    out = set()
+    for t in (w.field_name, w.field_label or ""):
+        t = _words(re.sub(r"^(ethnicity|gender)_", "", t))
+        t = re.sub(r"\(.*", "", t).strip()
+        if t:
+            out |= {t, re.sub(r" county$", "", t)}
+    return out
+
+
+def parse_label(text, with_score=False):
+    """'Agency Name:Acme Care' -> ('entity', 'Acme Care'); 'NPI1234567890' -> ('npi', '1234567890')."""
+    best = (0.0, None, "")
+    head, sep, val = text.partition(":")
+    head_w = _words(head)
+    letters = re.sub(r"[^A-Za-z]", "", text).lower()
+    for kind, labels in SCAN_LABELS.items():
+        for lab in labels:
+            if sep:
+                r = _ratio(head_w, lab)
+                if len(lab) <= 4 and len(head_w) >= 2 and lab.startswith(head_w):
+                    r = max(r, 0.85)                         # clipped short label: "NP:" for "NPI:"
+                if r > best[0]:
+                    best = (r, kind, val)
+            # colon lost: label glued to its value ("NPI1234567890", "Contac Emai x@y.com")
+            squeezed_lab = lab.replace(" ", "")
+            n = len(squeezed_lab)
+            for k in range(max(2, n - 2), min(len(letters), n + 2) + 1):
+                r = _ratio(letters[:k], squeezed_lab) - 0.02
+                if r <= best[0]:
+                    continue
+                m = re.match(r"(?:[^A-Za-z]*[A-Za-z]){%d}" % k, text)
+                rest = text[m.end():] if m else ""
+                # "Email completed form to ..." is a sentence, not a label: a one-word label
+                # must be glued to its value or be followed by a number
+                if " " in lab or (rest and not rest[0].isspace()) or rest.strip()[:1].isdigit():
+                    best = (r, kind, rest.lstrip(" :.-"))
+    kind, value = (best[1], best[2].strip()) if best[0] >= 0.82 else (None, "")
+    return (kind, value, best[0]) if with_score else (kind, value)
+
+
+def _gray_u8(page, dpi):
+    pix = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY)
+    return np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width).copy()
+
+
+def ocr_items(img):
+    """Whole-page OCR -> list of (x0, y0, x1, y1, text, conf)."""
+    ocr(np.full((8, 8), 255))                              # make sure the engine is loaded
+    result, _ = _rapid_engine(np.ascontiguousarray(np.stack([img] * 3, axis=-1)))
+    items = []
+    for box, text, conf in result or []:
+        b = np.asarray(box)
+        items.append((*b.min(0), *b.max(0), text.translate(HOMOGLYPHS).strip(), float(conf)))
+    return [(int(i[0]), int(i[1]), int(i[2]), int(i[3]), i[4], i[5]) for i in items if i[4]]
+
+
+def find_squares(img, size):
+    """Checkbox-like squares about `size` px tall (outer box kept when boxes are nested)."""
+    import cv2
+    block = max(15, int(size) | 1)
+    th = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, block, 15)
+    contours, _ = cv2.findContours(th, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    found = []
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        if 0.4 * size <= w <= 1.6 * size and 0.4 * size <= h <= 1.6 * size and 0.7 <= w / h <= 1.4 \
+                and cv2.contourArea(cv2.convexHull(c)) >= 0.75 * w * h:
+            found.append((x, y, w, h))
+    found.sort(key=lambda b: -b[2] * b[3])
+    keep = []
+    for x, y, w, h in found:
+        cx, cy = x + w / 2, y + h / 2
+        if not any(k[0] <= cx <= k[0] + k[2] and k[1] <= cy <= k[1] + k[3] for k in keep):
+            keep.append((x, y, w, h))
+    return keep
+
+
+def box_center_ink(img, x, y, w, h):
+    """(contrast, dark share) of the box's middle against the paper just outside the box.
+    Only the middle is measured, so double ("box inside box") borders don't count; the paper
+    is measured right next to the box, so gray scans, glare and screen moire cancel out.
+    Empty ~ (0, 0); tick ~ (0.4, 0.3); filled square ~ (1+, 1)."""
+    i = int(round(min(w, h) * 0.3))
+    center = img[y + i:y + h - i, x + i:x + w - i].astype(np.float32)
+    if center.size == 0:
+        return 0.0, 0.0
+    g, G = int(w * 0.15), int(w * 0.5)
+    y0, x0 = max(0, y - G), max(0, x - G)
+    big = img[y0:y + h + G, x0:x + w + G].astype(np.float32)
+    outside = np.ones(big.shape, bool)
+    outside[max(0, y - y0 - g):y - y0 + h + g, max(0, x - x0 - g):x - x0 + w + g] = False
+    paper = float(np.median(big[outside])) if outside.any() else 255.0
+    frame = np.concatenate([img[y:y + h, x:x + 2].ravel(), img[y:y + h, x + w - 2:x + w].ravel(),
+                            img[y:y + 2, x:x + w].ravel(), img[y + h - 2:y + h, x:x + w].ravel()])
+    ink = min(float(np.percentile(frame, 20)), paper - 60)  # box outline darkness = what "ink" looks like
+    contrast = float(np.clip((paper - center.mean()) / (paper - ink), 0, 1.5))
+    dark = float((center < ink + 0.35 * (paper - ink)).mean())
+    return contrast, dark
+
+
+def box_state(contrast, dark):
+    """'on', 'faint' (unchecked, needs review), 'light' (checked, lighter than a normal fill) or 'off'."""
+    if contrast >= CHECK_CONTRAST_ON and dark >= CHECK_DARK_ON:
+        return "light" if contrast >= 0.8 and dark < 0.8 else "on"
+    if contrast >= CHECK_CONTRAST_ON * 0.7 or dark >= CHECK_DARK_ON * 0.7:
+        return "faint"
+    return "off"
+
+
+def extract_by_labels(page):
+    """Read a scan that is a different form from the template. Returns (values, checks, info, review)."""
+    tpl_page = pymupdf.open(TEMPLATE)[0]
+    widgets = list(tpl_page.widgets())
+    text_w = [w for w in widgets if w.field_type == pymupdf.PDF_WIDGET_TYPE_TEXT]
+    box_w = [w for w in widgets if w.field_type == pymupdf.PDF_WIDGET_TYPE_CHECKBOX]
+    review = ["different form layout from the template - read by labels; please compare with the scan"]
+
+    img = _gray_u8(page, DYN_DPI)
+    items = ocr_items(img)
+    for k in (2, 1, 3):                                     # page upside down / sideways?
+        if sum(parse_label(t)[0] is not None for *_, t, _ in items) >= 2 or len(items) > 40:
+            break
+        rot = np.ascontiguousarray(np.rot90(img, k))
+        rot_items = ocr_items(rot)
+        if len(rot_items) > len(items):
+            img, items = rot, rot_items
+    if not items:
+        raise ValueError("no text found on the scan")
+    size = float(np.median([y1 - y0 for x0, y0, x1, y1, t, c in items]))
+
+    # ---- labelled text values ("Agency Name: ...", "NPI: ...")
+    found = {}
+    lines = sorted(items, key=lambda i: (i[1] + i[3]) / 2)
+    for idx, (x0, y0, x1, y1, text, conf) in enumerate(lines):
+        kind, value, score = parse_label(text, with_score=True)
+        if not kind or score <= found.get(kind, (0, None))[0]:
+            continue                                       # keep the best-matching label ("Agency Name:" beats a heading)
+        cy, h = (y0 + y1) / 2, y1 - y0
+        right = x1
+        # value may continue in separate OCR boxes to the right on the same line
+        for (a0, b0, a1, b1, t2, c2) in sorted(lines, key=lambda i: i[0]):
+            if a0 > right - 2 and abs((b0 + b1) / 2 - cy) < 0.5 * h and a0 - right < 2.5 * h:
+                if parse_label(t2)[0]:
+                    break
+                value, right, conf = f"{value} {t2}".strip(), a1, min(conf, c2)
+        cands = [(value.strip(), conf)]
+        # second read of just the value, enlarged 2x (small print like emails / NPI reads better)
+        pos = text.find(value[:3]) if value[:3] and value[:3] in text else 0   # where the value starts
+        start = int(x0 + (x1 - x0) * pos / max(len(text), 1))
+        crop = img[max(0, int(y0)):int(y1), max(0, start - 4):int(right + 4)]
+        if crop.size and kind in STRICT_KINDS:
+            t2, c2 = ocr(np.pad(ndimage.zoom(crop, 2, order=1), 30, constant_values=255))
+            k2, v2 = parse_label(t2)
+            cands.append(((v2 if k2 == kind else t2).strip(), c2))
+        found[kind] = (score, cands)
+
+    values = {}
+
+    def put(kind, cands, check=None):
+        name = template_field(text_w, kind)
+        scored = []
+        for value, conf in cands:
+            if value:
+                value, ok = check(value) if check else (value, True)
+                scored.append((ok, conf, value))
+        if not scored:
+            return
+        ok, conf, value = max(scored)
+        if not name:
+            review.append(f"'{kind}' on scan ({value}) - no matching field in the template")
+            return
+        values[name] = value
+        if not ok or conf < 0.5:
+            review.append(f"{name}: '{value}' (confidence {conf:.2f}{'' if ok else ', format check failed'})")
+
+    def digits_of(n):
+        return lambda v: (_digits(v), len(_digits(v)) == n)
+
+    for kind, (_, cands) in found.items():
+        if kind == "npi":
+            put("npi", cands, digits_of(10))
+        elif kind == "tin":
+            put("tin", cands, digits_of(9))
+        elif kind == "entity":
+            put("entity", cands, lambda v: (re.sub(r"\s+", " ", v), len(v) >= 2))
+        elif kind in ("phone", "fax") and not (kind == "phone" and "contact_phone" in found):
+            put(kind, cands, lambda v, k=kind: clean_value(f"owner_{k}", v))
+        elif kind == "contact_phone":
+            put("phone", cands, lambda v: clean_value("owner_phone", v))
+        elif kind in ("email", "contact_email") and not (kind == "email" and "contact_email" in found):
+            put("email", cands, lambda v: clean_value("owner_email", v))
+        elif kind in ("address", "caqh"):
+            put(kind, cands)
+        elif kind == "contact_name":
+            value = max(cands, key=lambda c: c[1])[0]
+            name = re.sub(r"[^A-Za-z' .-]", " ", value).split()
+            if template_field(text_w, "contact_name"):
+                put("contact_name", [(" ".join(name), 1.0)])
+            elif name:
+                # contact name -> owner first name (first word) / last name (the rest)
+                values["owner_first_name"], values["owner_last_name"] = name[0], " ".join(name[1:])
+                review.append(f"contact name '{' '.join(name)}' split into first '{name[0]}' / last '{' '.join(name[1:])}'")
+
+    # ---- checkboxes: match printed names to template checkboxes, then look left for the box
+    def inside_word(x, y, w, h):
+        """Square lies within an OCR'd word, past its first character => it's a letter (o, D, N...)."""
+        cx, cy = x + w / 2, y + h / 2
+        return any(i0 + 0.6 * (i3 - i1) < cx < i2 and i1 < cy < i3 for i0, i1, i2, i3, *_ in items)
+
+    squares = [s for s in find_squares(img, size) if not inside_word(*s)]
+    names = {w.field_name: checkbox_names(w) for w in box_w}
+
+    def label_score(text, field):
+        t = _words(text.translate(LETTER_FIX))
+        best = 0.0
+        for v in names[field]:
+            if not (0.45 * len(v) <= len(t) <= 1.6 * len(v) + 2):
+                continue
+            best = max(best, _ratio(t, v), _ratio(t[1:], v) if len(t) > 4 else 0)   # stray box glyph in front
+            if len(t) >= 12 and len(t) < len(v):
+                best = max(best, _ratio(t, v[:len(t)]) - 0.05)                     # name cut off at the end
+        return best
+
+    def box_left_of(x0, y0, x1, y1):
+        h, cy = y1 - y0, (y0 + y1) / 2
+        cands = [s for s in squares if abs(s[1] + s[3] / 2 - cy) < 0.6 * h
+                 and x0 - 2.2 * h <= s[0] + s[2] / 2 <= x0 + 0.8 * h]
+        if not cands:
+            return None
+        # a square left of where the word starts is the checkbox; one inside the word is a letter
+        # (N, o, D...) unless OCR swallowed the box into the word ("□Daviess")
+        left = [s for s in cands if s[0] + s[2] / 2 <= x0]
+        cands = left or cands
+        # drop small squares (letters), then take the one on the label's line
+        big = max(s[2] * s[3] for s in cands)
+        cands = [s for s in cands if s[2] * s[3] >= 0.6 * big]
+        return min(cands, key=lambda s: abs(s[1] + s[3] / 2 - cy) + 0.3 * abs(s[0] + s[2] - x0))
+
+    pairs = sorted(((label_score(it[4], f), i, f) for i, it in enumerate(items) for f in names), reverse=True)
+    used_items, matched = set(), {}
+    for score, i, f in pairs:
+        if score < 0.72:
+            break
+        if i in used_items or f in matched:
+            continue
+        box = box_left_of(*items[i][:4])
+        if box is None:
+            continue
+        used_items.add(i)
+        matched[f] = box
+
+    # second pass: boxes that have no name yet -> OCR just the text to their right
+    used_boxes = set(matched.values())
+    box_h = np.median([b[3] for b in used_boxes]) if used_boxes else size
+    for (x, y, w, h) in squares:
+        if (x, y, w, h) in used_boxes or not 0.75 * box_h <= h <= 1.3 * box_h:
+            continue
+        if any(i0 + 1.5 * (i3 - i1) < x + w / 2 < i2 and i1 < y + h / 2 < i3 for i0, i1, i2, i3, *_ in items):
+            continue                                       # a letter inside a word, not a checkbox
+        crop = img[max(0, y - h // 3):y + h + h // 3, x + w:x + w + int(13 * h)]
+        text, conf = ocr(np.pad(crop, 20, constant_values=255))
+        text = re.split(r"\s{2,}|\s+[^A-Za-z\s]{1,2}\s", text)[0]          # stop at the next column
+        cands = sorted(((label_score(text, f), f) for f in names if f not in matched), reverse=True)
+        if cands and cands[0][0] >= 0.72:
+            matched[cands[0][1]] = (x, y, w, h)
+        elif len(re.sub(r"[^A-Za-z]", "", text)) >= 3 and box_state(*box_center_ink(img, x, y, w, h)) in ("on", "light"):
+            review.append(f"checked box '{text.strip()}' on scan has no matching checkbox in the template")
+
+    checks = {f: False for f in names}
+    for f, (x, y, w, h) in matched.items():
+        state = box_state(*box_center_ink(img, x, y, w, h))
+        checks[f] = state in ("on", "light")
+        if state == "faint":
+            review.append(f"checkbox '{f}': light/partial mark, left unchecked")
+        elif state == "light":
+            review.append(f"checkbox '{f}': shaded lighter than a normal fill, checked - please confirm")
+
+    # report template boxes not found on the scan, for sections the scan does have
+    def group(f):
+        return "counties" if f.endswith("County") else f.split("_")[0] if "_" in f else "services"
+    for g in sorted({group(f) for f in names}):
+        members = [f for f in names if group(f) == g]
+        missing = [f for f in members if f not in matched]
+        if missing and len(missing) <= len(members) / 2:
+            review.append(f"{g}: could not find on scan (left unchecked): {', '.join(missing)}")
+
+    info = {"layout": "by labels", "page": 1, "boxes_matched": len(matched), "labels": len(found)}
+    return values, checks, info, review
+
+
 def extract(scan_path):
     tpl_doc = pymupdf.open(TEMPLATE)
     tpl_page = tpl_doc[0]
@@ -484,6 +864,10 @@ def extract(scan_path):
     page_no = pick_page(scan_doc, tpl_img)
     raw = normalize_paper(render_gray(scan_doc[page_no]))
     scan, info = align(raw, tpl_img)
+    if info["match"] < LAYOUT_MATCH_MIN:
+        values, checks, dyn_info, review = extract_by_labels(scan_doc[page_no])
+        dyn_info.update(page=page_no + 1, match=info["match"])
+        return values, checks, dyn_info, review
     info["page"] = page_no + 1
     mask = ink_mask(scan, tpl_img)
 
@@ -549,7 +933,13 @@ def fill_template(values, checks, out_path):
     for page in doc:
         for w in page.widgets():
             if w.field_type == pymupdf.PDF_WIDGET_TYPE_TEXT and w.field_name in values:
-                w.field_value = values[w.field_name]
+                text = values[w.field_name]
+                w.field_value = text
+                # shrink the font so long values (agency names, addresses) fit instead of being cut off
+                size = w.text_fontsize or 9
+                width = pymupdf.get_text_length(text, fontname="helv", fontsize=size)
+                if width > w.rect.width - 4:
+                    w.text_fontsize = max(5.0, size * (w.rect.width - 4) / width)
                 w.update()
             elif w.field_type == pymupdf.PDF_WIDGET_TYPE_CHECKBOX and w.field_name in checks:
                 # Set the state directly so the template's own drawn check mark is shown
@@ -578,8 +968,12 @@ def convert(scan_path, log=print):
     values, checks, info, review = extract(scan_path)
     out = output_path_for(scan_path)
     fill_template(values, checks, out)
-    log(f"  page {info['page']}, rotation {info['rotation90']}°, scale {info['scale']}, skew {info['skew_deg']}°, "
-        f"shift {info['shift_px']}px, template match {info['match']}")
+    if info.get("layout") == "by labels":
+        log(f"  page {info['page']}: different form from the template (match {info['match']}) - read by labels, "
+            f"{info['labels']} labelled values, {info['boxes_matched']} checkboxes located")
+    else:
+        log(f"  page {info['page']}, rotation {info['rotation90']}°, scale {info['scale']}, skew {info['skew_deg']}°, "
+            f"shift {info['shift_px']}px, template match {info['match']}")
     for k, v in values.items():
         if v:
             log(f"  {k}: {v}")
