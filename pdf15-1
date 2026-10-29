@@ -1,4 +1,3 @@
-
 import difflib
 import os
 import re
@@ -551,6 +550,12 @@ def output_path_for(scan_path):
 
 
 def convert(scan_path, log=print):
+    scan_path = os.path.normpath(scan_path)
+    if not os.path.isfile(TEMPLATE):
+        raise FileNotFoundError(f"Template not found: {TEMPLATE}\n"
+                                f"Copy the 'Template' folder (with Template_Form.pdf) next to scan_to_form.py")
+    if not os.path.isfile(scan_path):
+        raise FileNotFoundError(f"Scan not found: {scan_path}")
     os.makedirs(EXPORT_DIR, exist_ok=True)
     log(f"Reading {os.path.basename(scan_path)} ...")
     values, checks, info, review = extract(scan_path)
@@ -615,9 +620,14 @@ def run_gui():
             log(f"Could not open {path}: {e}")
 
     def choose():
-        paths = filedialog.askopenfilenames(title="Select scanned PDF", initialdir=BASE_DIR,
+        # Windows ignores initialdir once it has been used before and jumps to the last-used folder;
+        # a full path in the file-name box overrides that, so the picker always opens in the script folder.
+        start = {"initialfile": os.path.join(BASE_DIR, "*.pdf")} if sys.platform == "win32" else {}
+        paths = filedialog.askopenfilenames(title="Select scanned PDF", initialdir=BASE_DIR, **start,
                                             filetypes=[("PDF / image scans", "*.pdf *.png *.jpg *.jpeg *.tif *.tiff"),
                                                        ("All files", "*.*")])
+        # Windows Tk can hand back one "{C:/a b.pdf} {C:/c.pdf}" string instead of a tuple.
+        paths = [os.path.normpath(p) for p in root.tk.splitlist(paths)] if paths else []
         if paths:
             selected[:] = paths
             sel_var.set("; ".join(os.path.basename(p) for p in paths))
@@ -632,7 +642,7 @@ def run_gui():
                 outputs.append(out)
                 flagged += bool(review)
             except Exception as e:
-                log(f"ERROR on {os.path.basename(p)}: {e}")
+                log(f"ERROR on {p}: {e}")
             log("")
         convert_btn.config(state="normal")
         if outputs:
