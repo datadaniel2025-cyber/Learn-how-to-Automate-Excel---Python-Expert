@@ -97,9 +97,10 @@ def _xcorr(a, b):
     return float(score), int(dy), int(dx)
 
 
-def align(scan, tpl):
+def align(scan, tpl, extra=None):
     """Rotate (90-steps + fine skew), resize and shift scan onto the template grid.
-    Returns (aligned_scan, info_dict)."""
+    Returns (aligned_scan, info_dict). `extra` (same size as scan, white = 255) gets the
+    identical transform and comes back as info["extra"]."""
     step = 8
     tpl_small = tpl[::step, ::step]
     tb = _ink(tpl_small)
@@ -113,6 +114,8 @@ def align(scan, tpl):
             best = (score, k)
     k = best[1]
     scan = fit_shape(np.rot90(scan, k), tpl.shape)
+    if extra is not None:
+        extra = fit_shape(np.rot90(extra, k), tpl.shape)
 
     # Scale: scanners/printers often shrink the page ("fit to page", A4 vs Letter).
     step = 4
@@ -130,6 +133,8 @@ def align(scan, tpl):
             best_zoom, best_score = float(z), s
     if abs(best_zoom - 1) > 0.001:
         scan = fit_shape(scan, tpl.shape, zoom=best_zoom)
+        if extra is not None:
+            extra = fit_shape(extra, tpl.shape, zoom=best_zoom)
 
     # Fine skew: try small angles on a reduced image.
     small = scan[::step, ::step].astype(np.float32)
@@ -142,18 +147,22 @@ def align(scan, tpl):
     best_score = max(best_score, 0)
     if best_angle:
         scan = ndimage.rotate(scan.astype(np.float32), best_angle, reshape=False, order=1, cval=255).astype(np.int16)
+        if extra is not None:
+            extra = ndimage.rotate(extra.astype(np.float32), best_angle, reshape=False, order=1, cval=255).astype(np.int16)
 
     # Translation at full resolution precision (estimated at step 2, refined locally).
     _, dy, dx = _xcorr(_ink(scan[::2, ::2]), _ink(tpl[::2, ::2]))
     dy, dx = dy * 2, dx * 2
     scan = ndimage.shift(scan, (-dy, -dx), order=0, cval=255)
-    scan = local_align(scan, tpl)
+    if extra is not None:
+        extra = ndimage.shift(extra, (-dy, -dx), order=0, cval=255)
+    scan, extra = local_align(scan, tpl, extra)
     match = _xcorr(_ink(scan[::4, ::4]), tb)[0]
-    return scan, {"rotation90": k * 90, "scale": round(best_zoom, 3), "skew_deg": best_angle,
+    return scan, {"extra": extra, "rotation90": k * 90, "scale": round(best_zoom, 3), "skew_deg": best_angle,
                   "shift_px": (dy, dx), "match": round(match, 3)}
 
 
-def local_align(scan, tpl, tile=360, search=14):
+def local_align(scan, tpl, extra=None, tile=360, search=14):
     """Fine-tune alignment tile by tile (absorbs leftover skew, scale and paper warp)."""
     h, w = tpl.shape
     ny, nx = (h + tile - 1) // tile, (w + tile - 1) // tile
@@ -173,14 +182,14 @@ def local_align(scan, tpl, tile=360, search=14):
             shifts[iy, ix] = (dy - search, dx - search)
             valid[iy, ix] = True
     if not valid.any():
-        return scan
+        return scan, extra
     # Fill empty tiles from neighbours, then median-smooth to reject bad estimates.
     med = np.median(shifts[valid], axis=0)
     shifts[~valid] = med
     shifts[..., 0] = ndimage.median_filter(shifts[..., 0], size=3, mode="nearest")
     shifts[..., 1] = ndimage.median_filter(shifts[..., 1], size=3, mode="nearest")
     if np.abs(shifts).max() < 1:
-        return scan
+        return scan, extra
     # Smooth per-pixel displacement field from the tile grid.
     yy = (np.arange(h) + 0.5) / tile - 0.5
     xx = (np.arange(w) + 0.5) / tile - 0.5
@@ -188,7 +197,8 @@ def local_align(scan, tpl, tile=360, search=14):
     dy = ndimage.map_coordinates(shifts[..., 0], [gy, gx], order=1)
     dx = ndimage.map_coordinates(shifts[..., 1], [gy, gx], order=1)
     ry, rx = np.mgrid[0:h, 0:w]
-    return ndimage.map_coordinates(scan.astype(np.float32), [ry + dy, rx + dx], order=1, cval=255).astype(np.int16)
+    warp = lambda a: ndimage.map_coordinates(a.astype(np.float32), [ry + dy, rx + dx], order=1, cval=255).astype(np.int16)
+    return warp(scan), (warp(extra) if extra is not None else None)
 
 
 def ink_mask(scan, tpl):
@@ -427,7 +437,7 @@ def read_text_field(name, rect, mask, scan):
 
 
 # ================================================================ checkboxes
-def detect_checkboxes(mask, boxes, text_rects):
+def detect_checkboxes(mask, boxes, text_rects, scan=None, tpl=None, colorless=None):
     """Return ({field_name: ink_score}, mask_without_ticks).
     Each ink stroke is credited to ONE box, chosen by the stroke's lowest point (the
     vertex of a tick): inside a box, or just above it, wins; strokes far from any box
@@ -482,6 +492,25 @@ def detect_checkboxes(mask, boxes, text_rects):
         if interior.size and interior.mean() >= FILL_RATIO:
             score[name] = max(score[name], CHECK_MIN_PIXELS * 10)
             tick_mask[y0:y1, x0:x1] = True
+
+    # Light fills (pale gray / colored shading too light to count as ink): the box interior is
+    # evenly darker than the template's, compared with how the other boxes on the page came out.
+    if scan is not None and tpl is not None:
+        inset = int(1.2 * SCALE)
+        diffs = {name: (tpl[y0 + inset:y1 - inset, x0 + inset:x1 - inset].astype(np.int16)
+                        - scan[y0 + inset:y1 - inset, x0 + inset:x1 - inset])
+                 for name, (y0, y1, x0, x1) in box_px}
+        typical = float(np.median([np.median(d) for d in diffs.values() if d.size]))
+        if colorless is not None:                          # pale yellow etc.: same gray, but colored
+            sats = {name: 255 - colorless[y0 + inset:y1 - inset, x0 + inset:x1 - inset]
+                    for name, (y0, y1, x0, x1) in box_px}
+            typical_sat = float(np.median([np.median(v) for v in sats.values() if v.size]))
+        for name, d in diffs.items():
+            tinted = (d - typical) >= 18
+            if colorless is not None:
+                tinted = tinted | ((sats[name] - typical_sat) >= 30)
+            if d.size and tinted.mean() >= CHECK_SHADED_ON:
+                score[name] = max(score[name], CHECK_MIN_PIXELS * 10)
     return score, mask & ~tick_mask
 
 
@@ -509,6 +538,7 @@ LAYOUT_MATCH_MIN = 0.6    # template match below this => different form, read it
 DYN_DPI = 300
 CHECK_CONTRAST_ON = 0.36  # box middle this much darker than the paper beside it (1 = as dark as the outline) ...
 CHECK_DARK_ON = 0.28      # ... and this share of it truly ink-dark => checked (tick or filled square)
+CHECK_SHADED_ON = 0.85    # or this share of it evenly tinted / colored => checked (light-colored fill)
 
 # label printed on the scan -> what it is
 SCAN_LABELS = {
@@ -536,7 +566,8 @@ TEMPLATE_KEYS = {
     "fax": [r"\bfax\b"],
     "address": [r"\baddress\b"],
     "caqh": [r"\bcaqh\b"],
-    "contact_name": [r"\bcontact name\b"],
+    "first_name": [r"\bfirst name\b", r"\bfirst\b"],
+    "last_name": [r"\blast name\b", r"\blast\b"],
 }
 STRICT_KINDS = {"npi", "tin", "phone", "contact_phone", "fax", "email", "contact_email"}  # re-read enlarged
 LETTER_FIX = str.maketrans({"0": "o", "1": "i", "5": "s", "8": "b", "9": "g", "|": "l"})
@@ -603,9 +634,17 @@ def parse_label(text, with_score=False):
     return (kind, value, best[0]) if with_score else (kind, value)
 
 
+def _rgb_u8(page, dpi):
+    pix = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csRGB, alpha=False)
+    return np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, 3).copy()
+
+
+def _gray_of(rgb):
+    return np.clip(rgb @ np.array([0.299, 0.587, 0.114]), 0, 255).astype(np.uint8)
+
+
 def _gray_u8(page, dpi):
-    pix = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY)
-    return np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width).copy()
+    return _gray_of(_rgb_u8(page, dpi))
 
 
 def ocr_items(img):
@@ -640,15 +679,16 @@ def find_squares(img, size):
     return keep
 
 
-def box_center_ink(img, x, y, w, h):
-    """(contrast, dark share) of the box's middle against the paper just outside the box.
+def box_center_ink(img, x, y, w, h, rgb=None):
+    """(contrast, dark share, shaded share) of the box's middle against the paper just outside the box.
     Only the middle is measured, so double ("box inside box") borders don't count; the paper
     is measured right next to the box, so gray scans, glare and screen moire cancel out.
-    Empty ~ (0, 0); tick ~ (0.4, 0.3); filled square ~ (1+, 1)."""
+    Shaded share = how much of the middle is tinted/colored at all (a light gray or yellow fill).
+    Empty ~ (0, 0, 0); tick ~ (0.4, 0.3, 0.4); filled square ~ (1+, 1, 1); light fill ~ (0.1+, 0, 1)."""
     i = int(round(min(w, h) * 0.3))
     center = img[y + i:y + h - i, x + i:x + w - i].astype(np.float32)
     if center.size == 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
     g, G = int(w * 0.15), int(w * 0.5)
     y0, x0 = max(0, y - G), max(0, x - G)
     big = img[y0:y + h + G, x0:x + w + G].astype(np.float32)
@@ -660,13 +700,21 @@ def box_center_ink(img, x, y, w, h):
     ink = min(float(np.percentile(frame, 20)), paper - 60)  # box outline darkness = what "ink" looks like
     contrast = float(np.clip((paper - center.mean()) / (paper - ink), 0, 1.5))
     dark = float((center < ink + 0.35 * (paper - ink)).mean())
-    return contrast, dark
+    tinted = (paper - center) >= max(15.0, 0.08 * (paper - ink))
+    if rgb is not None:                                      # colored fill (yellow/blue/...) even if light
+        sat = lambda a: a.max(-1).astype(np.int16) - a.min(-1)
+        paper_sat = float(np.median(sat(rgb[y0:y + h + G, x0:x + w + G])[outside])) if outside.any() else 0.0
+        tinted |= sat(rgb[y + i:y + h - i, x + i:x + w - i]) >= paper_sat + 30
+    return contrast, dark, float(tinted.mean())
 
 
-def box_state(contrast, dark):
-    """'on', 'faint' (unchecked, needs review), 'light' (checked, lighter than a normal fill) or 'off'."""
+def box_state(contrast, dark, shaded=0.0, fills_count=True):
+    """'on', 'faint' (unchecked, needs review), 'light' (checked, filled with a light shade/color) or 'off'.
+    fills_count=False when most boxes on the page are tinted (printed background, not a fill)."""
     if contrast >= CHECK_CONTRAST_ON and dark >= CHECK_DARK_ON:
         return "light" if contrast >= 0.8 and dark < 0.8 else "on"
+    if fills_count and shaded >= CHECK_SHADED_ON:
+        return "light"
     if contrast >= CHECK_CONTRAST_ON * 0.7 or dark >= CHECK_DARK_ON * 0.7:
         return "faint"
     return "off"
@@ -680,7 +728,8 @@ def extract_by_labels(page):
     box_w = [w for w in widgets if w.field_type == pymupdf.PDF_WIDGET_TYPE_CHECKBOX]
     review = ["different form layout from the template - read by labels; please compare with the scan"]
 
-    img = _gray_u8(page, DYN_DPI)
+    rgb = _rgb_u8(page, DYN_DPI)
+    img = _gray_of(rgb)
     items = ocr_items(img)
     for k in (2, 1, 3):                                     # page upside down / sideways?
         if sum(parse_label(t)[0] is not None for *_, t, _ in items) >= 2 or len(items) > 40:
@@ -688,7 +737,7 @@ def extract_by_labels(page):
         rot = np.ascontiguousarray(np.rot90(img, k))
         rot_items = ocr_items(rot)
         if len(rot_items) > len(items):
-            img, items = rot, rot_items
+            img, items, rgb = rot, rot_items, np.ascontiguousarray(np.rot90(rgb, k))
     if not items:
         raise ValueError("no text found on the scan")
     size = float(np.median([y1 - y0 for x0, y0, x1, y1, t, c in items]))
@@ -759,12 +808,15 @@ def extract_by_labels(page):
         elif kind == "contact_name":
             value = max(cands, key=lambda c: c[1])[0]
             name = re.sub(r"[^A-Za-z' .-]", " ", value).split()
-            if template_field(text_w, "contact_name"):
-                put("contact_name", [(" ".join(name), 1.0)])
-            elif name:
-                # contact name -> owner first name (first word) / last name (the rest)
-                values["owner_first_name"], values["owner_last_name"] = name[0], " ".join(name[1:])
+            first_f, last_f = template_field(text_w, "first_name"), template_field(text_w, "last_name")
+            if name and first_f:
+                # contact name -> (owner) first name = first word, last name = the rest
+                values[first_f] = name[0]
+                if last_f:
+                    values[last_f] = " ".join(name[1:])
                 review.append(f"contact name '{' '.join(name)}' split into first '{name[0]}' / last '{' '.join(name[1:])}'")
+            elif name:
+                review.append(f"contact name '{' '.join(name)}' - template has no First Name field")
 
     # ---- checkboxes: match printed names to template checkboxes, then look left for the box
     def inside_word(x, y, w, h):
@@ -781,9 +833,12 @@ def extract_by_labels(page):
         for v in names[field]:
             if not (0.45 * len(v) <= len(t) <= 1.6 * len(v) + 2):
                 continue
-            best = max(best, _ratio(t, v), _ratio(t[1:], v) if len(t) > 4 else 0)   # stray box glyph in front
+            r = max(_ratio(t, v), _ratio(t[1:], v) if len(t) > 4 else 0)            # stray box glyph in front
             if len(t) >= 12 and len(t) < len(v):
-                best = max(best, _ratio(t, v[:len(t)]) - 0.05)                     # name cut off at the end
+                r = max(r, _ratio(t, v[:len(t)]) - 0.05)                           # name cut off at the end
+            if len(v) <= 5 and r < 0.85:
+                r = 0.0                                    # short names ("Jay", "Male") need a close match
+            best = max(best, r)
         return best
 
     def box_left_of(x0, y0, x1, y1):
@@ -828,17 +883,21 @@ def extract_by_labels(page):
         cands = sorted(((label_score(text, f), f) for f in names if f not in matched), reverse=True)
         if cands and cands[0][0] >= 0.72:
             matched[cands[0][1]] = (x, y, w, h)
-        elif len(re.sub(r"[^A-Za-z]", "", text)) >= 3 and box_state(*box_center_ink(img, x, y, w, h)) in ("on", "light"):
+        elif len(re.sub(r"[^A-Za-z]", "", text)) >= 3 and box_state(*box_center_ink(img, x, y, w, h)) == "on":
             review.append(f"checked box '{text.strip()}' on scan has no matching checkbox in the template")
 
     checks = {f: False for f in names}
-    for f, (x, y, w, h) in matched.items():
-        state = box_state(*box_center_ink(img, x, y, w, h))
+    measured = {f: box_center_ink(img, *b, rgb=rgb) for f, b in matched.items()}
+    # if most boxes are tinted, the tint is the form's printed background, not someone's fill
+    tinted_boxes = sum(m[2] >= CHECK_SHADED_ON for m in measured.values())
+    fills_count = tinted_boxes <= 0.4 * max(len(measured), 1)
+    for f, m in measured.items():
+        state = box_state(*m, fills_count=fills_count)
         checks[f] = state in ("on", "light")
         if state == "faint":
             review.append(f"checkbox '{f}': light/partial mark, left unchecked")
         elif state == "light":
-            review.append(f"checkbox '{f}': shaded lighter than a normal fill, checked - please confirm")
+            review.append(f"checkbox '{f}': filled with a light shade/color - counted as checked")
 
     # report template boxes not found on the scan, for sections the scan does have
     def group(f):
@@ -862,8 +921,12 @@ def extract(scan_path):
     if scan_doc.needs_pass:
         raise ValueError("PDF is password protected")
     page_no = pick_page(scan_doc, tpl_img)
-    raw = normalize_paper(render_gray(scan_doc[page_no]))
-    scan, info = align(raw, tpl_img)
+    rgb = _rgb_u8(scan_doc[page_no], DPI)
+    raw = normalize_paper(_gray_of(rgb).astype(np.int16))
+    colorless = 255 - (rgb.max(-1).astype(np.int16) - rgb.min(-1))   # 255 = no color, lower = colored
+    del rgb
+    scan, info = align(raw, tpl_img, extra=colorless)
+    colorless = info.pop("extra")
     if info["match"] < LAYOUT_MATCH_MIN:
         values, checks, dyn_info, review = extract_by_labels(scan_doc[page_no])
         dyn_info.update(page=page_no + 1, match=info["match"])
@@ -879,7 +942,7 @@ def extract(scan_path):
     if info["match"] < 0.25:
         review.append(f"scan matches the template poorly (score {info['match']}) - is this the right form?")
 
-    scores, text_mask = detect_checkboxes(mask, boxes, [r for _, r in text_fields])
+    scores, text_mask = detect_checkboxes(mask, boxes, [r for _, r in text_fields], scan, tpl_img, colorless)
     checks = {k: v >= CHECK_MIN_PIXELS for k, v in scores.items()}
     for k, v in scores.items():
         if CHECK_MIN_PIXELS * 0.5 <= v < CHECK_MIN_PIXELS:
