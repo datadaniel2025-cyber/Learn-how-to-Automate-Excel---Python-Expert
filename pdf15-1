@@ -1,0 +1,663 @@
+
+import difflib
+import os
+import re
+import sys
+from collections import Counter
+
+import numpy as np
+import pymupdf
+from scipy import ndimage
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMPLATE = os.path.join(BASE_DIR, "Template", "Template_Form.pdf")
+EXPORT_DIR = os.path.join(BASE_DIR, "Export")
+
+DPI = 400                 # render resolution for OCR / mark detection
+SCALE = DPI / 72.0
+INK_DIFF = 80             # how much darker than the template a pixel must be to count as ink
+CHECK_MIN_PIXELS = 60     # ink pixels (at DPI) needed to call a checkbox ticked
+CHECK_SEARCH_PT = 9       # how far (points) from a box an offset tick may sit
+FILL_RATIO = 0.35         # share of a box's interior covered in ink => filled-in box = checked
+TEXT_MIN_PIXELS = 40      # ink pixels inside a text field before we bother OCR-ing it
+SINGLE_CHAR_FIELDS = {"owner_middle_initial"}
+EXCLUSIVE_PAIRS = [("new_enrollment", "update_enrollment"), ("gender_male", "gender_female")]
+
+# Cyrillic/Greek look-alikes OCR sometimes returns for Latin letters.
+HOMOGLYPHS = str.maketrans("АВСЕНІЈКМОРЅТХУаеорсухіјΑΒΕΗΙΚΜΝΟΡΤΧΥΖ",
+                           "ABCEHIJKMOPSTXYaeopcyxijABEHIKMNOPTXYZ")
+DIGIT_FIX = str.maketrans({"O": "0", "o": "0", "D": "0", "Q": "0", "I": "1", "l": "1", "|": "1",
+                           "i": "1", "!": "1", "S": "5", "s": "5", "B": "8", "Z": "2", "z": "2",
+                           "G": "6", "b": "6", "g": "9", "q": "9"})
+
+
+
+def _load_words():
+    # English word list used to re-join split OCR words; ships next to the script.
+    try:
+        with open(os.path.join(BASE_DIR, "words.txt"), encoding="utf-8", errors="ignore") as f:
+            return {w.strip().lower() for w in f if w.strip()}
+    except OSError:
+        return set()
+
+
+WORDS = _load_words()
+DOMAIN_WORDS = ["enrollment", "enrollments", "update", "updated", "provider", "address", "county",
+                "counties", "services", "information", "telephone", "ownership", "agency"]
+WORDS |= set(DOMAIN_WORDS) | {"n/a", "email", "phone", "fax"}
+EMAIL_DOMAINS = ["example.com", "gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "aol.com",
+                 "icloud.com", "live.com", "msn.com", "comcast.net", "att.net", "sbcglobal.net"]
+
+
+# ================================================================ rendering
+def _to_array(pix):
+    return np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width).astype(np.int16)
+
+
+def render_gray(page, dpi=DPI, annots=False):
+    return _to_array(page.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY, annots=annots))
+
+
+def normalize_paper(img):
+    """Lift the paper to white (handles gray/yellow scans) without darkening printed lines."""
+    paper = np.percentile(img, 90)
+    if paper >= 250 or paper < 120:
+        return img
+    out = img.astype(np.float32) * (255.0 / paper)
+    return np.clip(out, 0, 255).astype(np.int16)
+
+
+def fit_shape(img, shape, zoom=None):
+    """Scale img (keeping aspect ratio, by width unless zoom is given) and pad/crop it to shape."""
+    if img.shape == shape and zoom is None:
+        return img
+    z = zoom if zoom is not None else shape[1] / img.shape[1]
+    if abs(z - 1) > 0.002:
+        img = ndimage.zoom(img.astype(np.float32), z, order=1).astype(np.int16)
+    h, w = shape
+    img = np.pad(img, ((0, max(0, h - img.shape[0])), (0, max(0, w - img.shape[1]))), constant_values=255)
+    return img[:h, :w]
+
+
+# ================================================================ alignment
+def _ink(img):
+    a = 255.0 - img.astype(np.float32)
+    return a - a.mean()
+
+
+def _xcorr(a, b):
+    """Return (peak score, dy, dx) of the best translation of a onto b."""
+    c = np.fft.irfft2(np.fft.rfft2(a) * np.conj(np.fft.rfft2(b)), s=a.shape)
+    dy, dx = np.unravel_index(np.argmax(c), c.shape)
+    score = c[dy, dx] / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9)
+    if dy > a.shape[0] // 2:
+        dy -= a.shape[0]
+    if dx > a.shape[1] // 2:
+        dx -= a.shape[1]
+    return float(score), int(dy), int(dx)
+
+
+def align(scan, tpl):
+    """Rotate (90-steps + fine skew), resize and shift scan onto the template grid.
+    Returns (aligned_scan, info_dict)."""
+    step = 8
+    tpl_small = tpl[::step, ::step]
+    tb = _ink(tpl_small)
+
+    # Coarse orientation.
+    best = None
+    for k in range(4):
+        cand = fit_shape(np.rot90(scan, k)[::step, ::step], tpl_small.shape)
+        score = _xcorr(_ink(cand), tb)[0]
+        if best is None or score > best[0]:
+            best = (score, k)
+    k = best[1]
+    scan = fit_shape(np.rot90(scan, k), tpl.shape)
+
+    # Scale: scanners/printers often shrink the page ("fit to page", A4 vs Letter).
+    step = 4
+    tpl_small = tpl[::step, ::step]
+    tb = _ink(tpl_small)
+    base_small = scan[::step, ::step]
+    best_zoom, best_score = 1.0, -1
+    for z in np.arange(0.88, 1.121, 0.01):
+        s = _xcorr(_ink(fit_shape(base_small, tpl_small.shape, zoom=z)), tb)[0]
+        if s > best_score + 1e-4:
+            best_zoom, best_score = float(z), s
+    for z in np.arange(best_zoom - 0.008, best_zoom + 0.0081, 0.002):
+        s = _xcorr(_ink(fit_shape(base_small, tpl_small.shape, zoom=z)), tb)[0]
+        if s > best_score + 1e-4:
+            best_zoom, best_score = float(z), s
+    if abs(best_zoom - 1) > 0.001:
+        scan = fit_shape(scan, tpl.shape, zoom=best_zoom)
+
+    # Fine skew: try small angles on a reduced image.
+    small = scan[::step, ::step].astype(np.float32)
+    best_angle, best_score = 0.0, -1
+    for angle in np.arange(-3.0, 3.01, 0.25):
+        rot = small if angle == 0 else ndimage.rotate(small, angle, reshape=False, order=1, cval=255)
+        s = _xcorr(_ink(rot), tb)[0]
+        if s > best_score + 1e-4:
+            best_angle, best_score = float(angle), s
+    best_score = max(best_score, 0)
+    if best_angle:
+        scan = ndimage.rotate(scan.astype(np.float32), best_angle, reshape=False, order=1, cval=255).astype(np.int16)
+
+    # Translation at full resolution precision (estimated at step 2, refined locally).
+    _, dy, dx = _xcorr(_ink(scan[::2, ::2]), _ink(tpl[::2, ::2]))
+    dy, dx = dy * 2, dx * 2
+    scan = ndimage.shift(scan, (-dy, -dx), order=0, cval=255)
+    scan = local_align(scan, tpl)
+    match = _xcorr(_ink(scan[::4, ::4]), tb)[0]
+    return scan, {"rotation90": k * 90, "scale": round(best_zoom, 3), "skew_deg": best_angle,
+                  "shift_px": (dy, dx), "match": round(match, 3)}
+
+
+def local_align(scan, tpl, tile=360, search=14):
+    """Fine-tune alignment tile by tile (absorbs leftover skew, scale and paper warp)."""
+    h, w = tpl.shape
+    ny, nx = (h + tile - 1) // tile, (w + tile - 1) // tile
+    shifts = np.zeros((ny, nx, 2))
+    valid = np.zeros((ny, nx), bool)
+    for iy in range(ny):
+        for ix in range(nx):
+            y0, x0 = iy * tile, ix * tile
+            t = tpl[y0:y0 + tile, x0:x0 + tile]
+            if (t < 128).mean() < 0.01:                     # tile has almost no printed structure
+                continue
+            sc = scan[y0:y0 + tile, x0:x0 + tile]
+            a, b = _ink(sc), _ink(t)
+            c = np.fft.irfft2(np.fft.rfft2(a) * np.conj(np.fft.rfft2(b)), s=a.shape)
+            c = np.roll(np.roll(c, search, 0), search, 1)[:2 * search + 1, :2 * search + 1]
+            dy, dx = np.unravel_index(np.argmax(c), c.shape)
+            shifts[iy, ix] = (dy - search, dx - search)
+            valid[iy, ix] = True
+    if not valid.any():
+        return scan
+    # Fill empty tiles from neighbours, then median-smooth to reject bad estimates.
+    med = np.median(shifts[valid], axis=0)
+    shifts[~valid] = med
+    shifts[..., 0] = ndimage.median_filter(shifts[..., 0], size=3, mode="nearest")
+    shifts[..., 1] = ndimage.median_filter(shifts[..., 1], size=3, mode="nearest")
+    if np.abs(shifts).max() < 1:
+        return scan
+    # Smooth per-pixel displacement field from the tile grid.
+    yy = (np.arange(h) + 0.5) / tile - 0.5
+    xx = (np.arange(w) + 0.5) / tile - 0.5
+    gy, gx = np.meshgrid(np.clip(yy, 0, ny - 1), np.clip(xx, 0, nx - 1), indexing="ij")
+    dy = ndimage.map_coordinates(shifts[..., 0], [gy, gx], order=1)
+    dx = ndimage.map_coordinates(shifts[..., 1], [gy, gx], order=1)
+    ry, rx = np.mgrid[0:h, 0:w]
+    return ndimage.map_coordinates(scan.astype(np.float32), [ry + dy, rx + dx], order=1, cval=255).astype(np.int16)
+
+
+def ink_mask(scan, tpl):
+    """True where the scan has ink the blank template does not (handwriting, typing, ticks)."""
+    tpl_dark = ndimage.grey_erosion(tpl, size=(7, 7))     # tolerate ~1px misalignment of printed lines
+    mask = (tpl_dark - scan) > INK_DIFF
+    mask |= (scan < 110) & (tpl_dark > 200)                   # clearly dark ink over white template paper
+    return ndimage.binary_opening(mask, structure=np.ones((2, 2)))
+
+
+# ================================================================ OCR
+_rapid_engine = None
+
+
+def ocr(gray_img):
+    """RapidOCR text recognition. Returns (text, mean confidence)."""
+    global _rapid_engine
+    if _rapid_engine is None:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+        except ImportError:
+            raise RuntimeError("OCR engine missing - run:  pip install -r requirements.txt") from None
+        _rapid_engine = RapidOCR()
+    img = np.clip(gray_img, 0, 255).astype(np.uint8)
+    result, _ = _rapid_engine(np.ascontiguousarray(np.stack([img] * 3, axis=-1)))
+    if not result:
+        return "", 0.0
+    # Words whose vertical spans overlap belong to the same line; read lines top-down, words left-right.
+    words = sorted((min(p[1] for p in box), max(p[1] for p in box), min(p[0] for p in box), text, float(conf))
+                   for box, text, conf in result)
+    lines = []
+    for w in words:
+        mid = (w[0] + w[1]) / 2
+        if lines and lines[-1][0] <= mid <= lines[-1][1]:
+            lines[-1][2].append(w)
+        else:
+            lines.append([w[0], w[1], [w]])
+    ordered = [w for _, _, ws in lines for w in sorted(ws, key=lambda w: w[2])]
+    text = " ".join(w[3] for w in ordered).translate(HOMOGLYPHS)
+    return text.strip(), sum(w[4] for w in ordered) / len(ordered)
+
+
+def _px(rect, pad=(0, 0, 0, 0)):
+    l, t, r, b = pad
+    return (int((rect.y0 - t) * SCALE), int((rect.y1 + b) * SCALE),
+            int((rect.x0 - l) * SCALE), int((rect.x1 + r) * SCALE))
+
+
+def _crop(img, rect, pad):
+    y0, y1, x0, x1 = _px(rect, pad)
+    return img[max(y0, 0):y1, max(x0, 0):x1]
+
+
+def mask_image(mask_crop):
+    return np.pad(np.where(mask_crop, 0, 255).astype(np.uint8), 40, constant_values=255)
+
+
+def tiled_char_ocr(mask_crop):
+    """OCR ignores a lone glyph; repeat it a few times and take the majority letter."""
+    ys, xs = np.nonzero(mask_crop)
+    if len(ys) == 0:
+        return "", 0.0
+    g = np.where(mask_crop[max(ys.min() - 6, 0):ys.max() + 6, max(xs.min() - 6, 0):xs.max() + 6], 0, 255).astype(np.uint8)
+    gap = np.full((g.shape[0], max(g.shape[1] // 2, 10)), 255, np.uint8)
+    votes, confs = Counter(), []
+    for k in (3, 4, 5):
+        t, c = ocr(np.pad(np.hstack([x for _ in range(k) for x in (g, gap)]), 40, constant_values=255))
+        for ch in re.sub(r"[^A-Za-z0-9]", "", t):
+            votes[ch.upper()] += 1
+        if t:
+            confs.append(c)
+    if not votes:
+        return "", 0.0
+    ch, n = votes.most_common(1)[0]
+    return ch, (sum(confs) / len(confs)) * (n / sum(votes.values()))
+
+
+# ================================================================ field cleanup / validation
+def _digits(s):
+    return re.sub(r"\D", "", s.translate(DIGIT_FIX))
+
+
+def _fix_split_words(t):
+    """Join OCR word fragments ("enrolm ent" -> "enrollment") using the system dictionary."""
+    toks = t.split(" ")
+    out = []
+    i = 0
+    while i < len(toks):
+        a = toks[i]
+        if i + 1 < len(toks) and a.isalpha() and toks[i + 1].isalpha():
+            b = toks[i + 1]
+            joined = (a + b).lower()
+            a_ok, b_ok = a.lower() in WORDS, b.lower() in WORDS
+            if not (a_ok and b_ok) or len(b) <= 2:
+                dom = difflib.get_close_matches(joined, DOMAIN_WORDS, n=1, cutoff=0.8)
+                if dom:
+                    out.append(dom[0])
+                    i += 2
+                    continue
+                if joined in WORDS:
+                    out.append(a + b)
+                    i += 2
+                    continue
+                close = difflib.get_close_matches(joined, [w for w in WORDS if w[:1] == joined[:1]
+                                                           and abs(len(w) - len(joined)) <= 2], n=1, cutoff=0.85)
+                if close and not (a_ok and b_ok):
+                    out.append(close[0])
+                    i += 2
+                    continue
+        out.append(a)
+        i += 1
+    return " ".join(out)
+
+
+def clean_value(name, text):
+    """Return (value, is_valid) for an OCR string."""
+    t = re.sub(r"\s+", " ", text.translate(HOMOGLYPHS)).strip()
+    if not t:
+        return "", False
+    if name == "owner_email":
+        t = re.sub(r"\s+", "", t)
+        t = re.sub(r"^[^A-Za-z0-9]+", "", t).rstrip(".,;:")
+        t = t.replace(",", ".").lower()
+        ok = bool(re.fullmatch(r"[\w.+'-]+@[\w-]+(\.[\w-]+)+", t))
+        if "@" in t:
+            local, domain = t.split("@", 1)
+            close = difflib.get_close_matches(domain, EMAIL_DOMAINS, n=1, cutoff=0.8)
+            if close and close[0] != domain:
+                return f"{local}@{close[0]}", False                 # snapped to a known domain: still review it
+        return t, ok
+    if name == "owner_ssn":
+        d = _digits(t)
+        return (f"{d[:3]}-{d[3:5]}-{d[5:]}", True) if len(d) == 9 else (t, False)
+    if name in ("owner_phone", "owner_fax"):
+        d = _digits(t)
+        if len(d) == 11 and d[0] == "1":
+            d = d[1:]
+        return (f"{d[:3]}-{d[3:6]}-{d[6:]}", True) if len(d) == 10 else (t, False)
+    if name == "owner_date_of_birth":
+        m = re.search(r"(\d{1,2})\s*[/\-.]\s*(\d{1,2})\s*[/\-.]\s*(\d{4}|\d{2})(?!\d)", t.translate(DIGIT_FIX))
+        if m:
+            mo, dy, yr = int(m.group(1)), int(m.group(2)), m.group(3)
+            ok = 1 <= mo <= 12 and 1 <= dy <= 31 and len(yr) == 4 and 1900 <= int(yr) <= 2100
+            return f"{mo:02d}/{dy:02d}/{yr}", ok
+        # A "1" written right after "/" often merges into the slash ("04/12/1982" -> "04/2/982").
+        m = re.search(r"(\d{1,2})\s*/\s*(\d{1,2})\s*/\s*(\d{3})\b", t.translate(DIGIT_FIX))
+        if m and m.group(3)[0] in "89":
+            mo, dy, yr = int(m.group(1)), m.group(2), "1" + m.group(3)
+            if len(dy) == 1 and int("1" + dy) <= 31:
+                dy = "1" + dy
+            if 1 <= mo <= 12 and 1 <= int(dy) <= 31:
+                return f"{mo:02d}/{int(dy):02d}/{yr}", False         # repaired guess: flag for review
+        d = _digits(t)
+        if len(d) == 8 and 1 <= int(d[:2]) <= 12 and 1 <= int(d[2:4]) <= 31:
+            return f"{d[:2]}/{d[2:4]}/{d[4:]}", True
+        return t, False
+    if name == "member_capacity":
+        d = _digits(t)
+        return (str(int(d)), True) if d else (t, False)
+    if name == "owner_middle_initial":
+        letters = re.sub(r"[^A-Za-z]", "", t)
+        return (letters[0].upper(), True) if letters else (t, False)
+    if name == "owner_suffix":
+        u = re.sub(r"[^A-Za-z/]", "", t).upper()
+        if u in ("NA", "N/A", "NIA", "N1A", "WA", "MA"):
+            return "N/A", True
+        known = {"JR": "Jr.", "JI": "Jr.", "JT": "Jr.", "SR": "Sr.", "ST": "Sr.", "II": "II", "III": "III", "IV": "IV", "V": "V"}
+        return (known[u], True) if u in known else (t, len(u) <= 4)
+    if name in ("owner_first_name", "owner_last_name"):
+        t = re.sub(r"[^A-Za-z' .-]", "", t).strip()
+        return t, bool(re.fullmatch(r"[A-Za-z][A-Za-z' .-]*", t))
+    # free text (update_explanation, other_ethnicity)
+    t = re.sub(r"^N\s*[/I1l]?\s*A\b", "N/A", t)
+    t = re.sub(r"\s*-\s*", " - ", t)
+    return _fix_split_words(t), True
+
+
+def read_text_field(name, rect, mask, scan):
+    """OCR one field several ways; return (value, confidence, valid)."""
+    inside = _crop(mask, rect, (0, 1, 0, 1))
+    if inside.sum() < TEXT_MIN_PIXELS:
+        return "", 1.0, True                               # blank field
+
+    mcrop = _crop(mask, rect, (4, 7, 4, 4))                # handwriting often rises above the box
+    gcrop = np.pad(_crop(scan, rect, (2, 1, 2, 2)), 40, constant_values=255)
+    tries = []
+    if name in SINGLE_CHAR_FIELDS:
+        tries.append(tiled_char_ocr(mcrop))
+    tries += [ocr(mask_image(mcrop)),
+              ocr(gcrop)]
+    if not any(t for t, _ in tries):
+        tries.append(tiled_char_ocr(mcrop))
+
+    scored = []
+    for raw, conf in tries:
+        if not raw:
+            continue
+        val, ok = clean_value(name, raw)
+        scored.append((ok, conf, val))
+    if not scored:
+        return "", 0.0, False
+    # Prefer answers that pass the format check, then agreement between independent passes,
+    # then the longer reading (OCR's usual mistake is dropping a squeezed character), then confidence.
+    agree = Counter(clean_value(name, r)[0] for r, _ in tries if r)
+    scored.sort(key=lambda s: (s[0], agree[s[2]], len(s[2]), s[1]), reverse=True)
+    ok, conf, val = scored[0]
+    return val, conf, ok
+
+
+# ================================================================ checkboxes
+def detect_checkboxes(mask, boxes, text_rects):
+    """Return ({field_name: ink_score}, mask_without_ticks).
+    Each ink stroke is credited to ONE box, chosen by the stroke's lowest point (the
+    vertex of a tick): inside a box, or just above it, wins; strokes far from any box
+    are ignored."""
+    m = mask.copy()
+    for r in text_rects:
+        y0, y1, x0, x1 = _px(r)
+        m[y0:y1, x0:x1] = False
+    labels, n = ndimage.label(m, structure=np.ones((3, 3)))
+    score = {name: 0 for name, _ in boxes}
+    tick_mask = np.zeros_like(mask)
+    if n == 0:
+        return score, mask
+
+    box_px = [(name, _px(r)) for name, r in boxes]
+    search = CHECK_SEARCH_PT * SCALE
+    max_span = 30 * SCALE                                  # bigger strokes are lines/scribbles, not ticks
+    for idx, sl in enumerate(ndimage.find_objects(labels), start=1):
+        comp = labels[sl] == idx
+        npx = int(comp.sum())
+        if npx < 15:
+            continue
+        if (sl[0].stop - sl[0].start) > max_span or (sl[1].stop - sl[1].start) > max_span:
+            continue
+        ys, xs = np.nonzero(comp)
+        ys = ys + sl[0].start
+        xs = xs + sl[1].start
+        bottom = ys.max()
+        px = int(xs[ys >= bottom - 2].mean())
+        py = int(bottom)
+        best, best_cost = None, None
+        for name, (y0, y1, x0, x1) in box_px:
+            dx = max(x0 - px, 0, px - x1)
+            if py < y0:
+                dy = y0 - py                               # vertex above box: typical offset tick
+            elif py > y1:
+                dy = (py - y1) * 3                         # below box: much less likely
+            else:
+                dy = 0
+            cost = (dx * 1.5) + dy
+            if cost <= search and (best_cost is None or cost < best_cost):
+                best, best_cost = name, cost
+        if best is not None:
+            score[best] += npx
+            tick_mask[sl] |= comp
+
+    # Filled-in / shaded / scribbled boxes: if the box interior is mostly ink, it is checked
+    # no matter what the strokes look like (covers solid fills that bleed into neighbours).
+    for name, (y0, y1, x0, x1) in box_px:
+        inset = int(1.2 * SCALE)
+        interior = mask[y0 + inset:y1 - inset, x0 + inset:x1 - inset]
+        if interior.size and interior.mean() >= FILL_RATIO:
+            score[name] = max(score[name], CHECK_MIN_PIXELS * 10)
+            tick_mask[y0:y1, x0:x1] = True
+    return score, mask & ~tick_mask
+
+
+# ================================================================ main conversion
+def pick_page(doc, tpl_img):
+    """For multi-page scans, use the page that best matches the template."""
+    if len(doc) == 1:
+        return 0
+    step = 8
+    tb = _ink(tpl_img[::step, ::step])
+    best = (-1, 0)
+    for i, page in enumerate(doc):
+        img = render_gray(page, dpi=DPI // step)
+        for k in range(4):
+            s = _xcorr(_ink(fit_shape(np.rot90(img, k), tb.shape)), tb)[0]
+            best = max(best, (s, i))
+    return best[1]
+
+
+def extract(scan_path):
+    tpl_doc = pymupdf.open(TEMPLATE)
+    tpl_page = tpl_doc[0]
+    tpl_img = render_gray(tpl_page, annots=True)      # blank boxes + field shading included
+
+    scan_doc = pymupdf.open(scan_path)
+    if scan_doc.needs_pass:
+        raise ValueError("PDF is password protected")
+    page_no = pick_page(scan_doc, tpl_img)
+    raw = normalize_paper(render_gray(scan_doc[page_no]))
+    scan, info = align(raw, tpl_img)
+    info["page"] = page_no + 1
+    mask = ink_mask(scan, tpl_img)
+
+    widgets = list(tpl_page.widgets())
+    text_fields = [(w.field_name, w.rect) for w in widgets if w.field_type == pymupdf.PDF_WIDGET_TYPE_TEXT]
+    boxes = [(w.field_name, w.rect) for w in widgets if w.field_type == pymupdf.PDF_WIDGET_TYPE_CHECKBOX]
+
+    review = []
+    if info["match"] < 0.25:
+        review.append(f"scan matches the template poorly (score {info['match']}) - is this the right form?")
+
+    scores, text_mask = detect_checkboxes(mask, boxes, [r for _, r in text_fields])
+    checks = {k: v >= CHECK_MIN_PIXELS for k, v in scores.items()}
+    for k, v in scores.items():
+        if CHECK_MIN_PIXELS * 0.5 <= v < CHECK_MIN_PIXELS:
+            review.append(f"checkbox '{k}': faint mark, left unchecked")
+    for a, b in EXCLUSIVE_PAIRS:
+        if checks.get(a) and checks.get(b):
+            loser = a if scores[a] < scores[b] else b
+            checks[loser] = False
+            review.append(f"both '{a}' and '{b}' marked; kept the stronger one")
+
+    values = {}
+    for name, rect in text_fields:
+        val, conf, ok = read_text_field(name, rect, text_mask, scan)
+        values[name] = val
+        if val and (not ok or conf < 0.5):
+            review.append(f"{name}: '{val}' (confidence {conf:.2f}{'' if ok else ', format check failed'})")
+        elif not val and _crop(text_mask, rect, (0, 1, 0, 1)).sum() >= TEXT_MIN_PIXELS:
+            review.append(f"{name}: has writing but could not be read")
+
+    # Cross-check: email local part usually spells the owner's name.
+    email, first, last = values.get("owner_email", ""), values.get("owner_first_name", ""), values.get("owner_last_name", "")
+    if "@" in email and first and last:
+        local, domain = email.split("@", 1)
+        guesses = {g.lower() for g in (f"{first}.{last}", f"{first}{last}", f"{first[0]}{last}", f"{first}_{last}")}
+        if local not in guesses:
+            ratio, guess = max((difflib.SequenceMatcher(None, local, g).ratio(), g) for g in guesses)
+            if ratio >= 0.85 and abs(len(local) - len(guess)) <= 2:
+                values["owner_email"] = f"{guess}@{domain}"
+                review.append(f"owner_email: corrected '{email}' -> '{guess}@{domain}' to match owner name")
+
+    if values.get("update_explanation") and not checks.get("update_enrollment") and not checks.get("new_enrollment"):
+        review.append("neither New nor Update enrollment is checked")
+    return values, checks, info, review
+
+
+def fill_template(values, checks, out_path):
+    doc = pymupdf.open(TEMPLATE)
+    for page in doc:
+        for w in page.widgets():
+            if w.field_type == pymupdf.PDF_WIDGET_TYPE_TEXT and w.field_name in values:
+                w.field_value = values[w.field_name]
+                w.update()
+            elif w.field_type == pymupdf.PDF_WIDGET_TYPE_CHECKBOX and w.field_name in checks:
+                w.field_value = w.on_state() if checks[w.field_name] else "Off"
+                w.update()
+    # Saved as a normal AcroForm: every field stays editable.
+    doc.save(out_path, garbage=3, deflate=True)
+
+
+def output_path_for(scan_path):
+    stem = os.path.splitext(os.path.basename(scan_path))[0]
+    return os.path.join(EXPORT_DIR, f"{stem}_converted.pdf")
+
+
+def convert(scan_path, log=print):
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    log(f"Reading {os.path.basename(scan_path)} ...")
+    values, checks, info, review = extract(scan_path)
+    out = output_path_for(scan_path)
+    fill_template(values, checks, out)
+    log(f"  page {info['page']}, rotation {info['rotation90']}°, scale {info['scale']}, skew {info['skew_deg']}°, "
+        f"shift {info['shift_px']}px, template match {info['match']}")
+    for k, v in values.items():
+        if v:
+            log(f"  {k}: {v}")
+    log("  checked: " + (", ".join(k for k, v in checks.items() if v) or "(none)"))
+    if review:
+        log("  REVIEW:")
+        for r in review:
+            log(f"    - {r}")
+    log(f"Saved -> {out}")
+    return out, review
+
+
+# ================================================================ GUI
+def run_gui():
+    import ctypes
+    import subprocess
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, scrolledtext
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)        # crisp text on high-DPI Windows screens
+    except (AttributeError, OSError):
+        pass
+    root = tk.Tk()
+    root.title("Scan to Form Converter")
+    root.geometry("760x520")
+
+    frm = tk.Frame(root, padx=12, pady=12)
+    frm.pack(fill="both", expand=True)
+    tk.Label(frm, text="1) Click Select PDF and pick a scanned form.   2) Click Generate.\nThe editable, filled form is saved to the Export folder as <name>_converted.pdf",
+             anchor="w").pack(fill="x")
+    sel_var = tk.StringVar(value="No file selected")
+    tk.Label(frm, textvariable=sel_var, anchor="w", fg="#555", wraplength=720, justify="left").pack(fill="x", pady=(4, 8))
+
+    btns = tk.Frame(frm)
+    btns.pack(fill="x")
+    log_box = scrolledtext.ScrolledText(frm, height=22, font=("Consolas", 10))
+    log_box.pack(fill="both", expand=True, pady=(10, 0))
+
+    selected = []
+
+    def log(msg):
+        log_box.insert("end", msg + "\n")
+        log_box.see("end")
+        root.update()
+
+    def open_path(path):
+        # Windows: open in the default PDF viewer / File Explorer. Elsewhere (testing only): macOS "open".
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(path)
+            else:
+                subprocess.run(["open", path], check=True)
+        except Exception as e:
+            log(f"Could not open {path}: {e}")
+
+    def choose():
+        paths = filedialog.askopenfilenames(title="Select scanned PDF", initialdir=BASE_DIR,
+                                            filetypes=[("PDF / image scans", "*.pdf *.png *.jpg *.jpeg *.tif *.tiff"),
+                                                       ("All files", "*.*")])
+        if paths:
+            selected[:] = paths
+            sel_var.set("; ".join(os.path.basename(p) for p in paths))
+            convert_btn.config(state="normal")
+
+    def do_convert():
+        convert_btn.config(state="disabled")
+        outputs, flagged = [], 0
+        for p in selected:
+            try:
+                out, review = convert(p, log)
+                outputs.append(out)
+                flagged += bool(review)
+            except Exception as e:
+                log(f"ERROR on {os.path.basename(p)}: {e}")
+            log("")
+        convert_btn.config(state="normal")
+        if outputs:
+            msg = f"{len(outputs)} file(s) saved to Export."
+            if flagged:
+                msg += f"\n{flagged} file(s) have items to REVIEW (see log)."
+            if messagebox.askyesno("Done", msg + "\n\nOpen the converted file(s)?"):
+                for o in outputs:
+                    open_path(o)
+
+    tk.Button(btns, text="Select PDF...", command=choose).pack(side="left")
+    convert_btn = tk.Button(btns, text="Generate", command=do_convert, state="disabled")
+    convert_btn.pack(side="left", padx=8)
+    tk.Button(btns, text="Open Export Folder",
+              command=lambda: (os.makedirs(EXPORT_DIR, exist_ok=True), open_path(EXPORT_DIR))
+              ).pack(side="right")
+
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    if sys.stdout is not None:
+        sys.stdout.reconfigure(errors="replace")             # Windows console code pages can't print every character
+    if len(sys.argv) > 1:
+        for p in sys.argv[1:]:
+            convert(p)
+    else:
+        run_gui()
